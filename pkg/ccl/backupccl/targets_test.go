@@ -19,20 +19,127 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestDescriptorsMatchingTargets(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	descriptors := []sqlbase.Descriptor{
-		*sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{ID: 0, Name: "system"}),
-		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 1, Name: "foo", ParentID: 0}),
-		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 2, Name: "bar", ParentID: 0}),
-		*sqlbase.WrapDescriptor(&sqlbase.TableDescriptor{ID: 4, Name: "baz", ParentID: 3}),
-		*sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{ID: 3, Name: "data"}),
-		*sqlbase.WrapDescriptor(&sqlbase.DatabaseDescriptor{ID: 5, Name: "empty"}),
+	// TODO(ajwerner): There should be a constructor for an ImmutableTableDescriptor
+	// and really all of the leasable descriptor types which includes its initial
+	// DescriptorMeta. This refactoring precedes the actual adoption of
+	// DescriptorMeta.
+	var descriptors []sqlbase.Descriptor
+	{
+		// Make shorthand type names for syntactic sugar.
+		type tbDesc = sqlbase.TableDescriptor
+		type typDesc = sqlbase.TypeDescriptor
+		ts1 := hlc.Timestamp{WallTime: 1}
+		mkTable := func(descriptor tbDesc) sqlbase.Descriptor {
+			desc := sqlbase.NewImmutableTableDescriptor(descriptor)
+			desc.ModificationTime = ts1
+			return *desc.DescriptorProto()
+		}
+		mkDB := func(id sqlbase.ID, name string) sqlbase.Descriptor {
+			return *sqlbase.NewInitialDatabaseDescriptor(id, name).DescriptorProto()
+		}
+		mkTyp := func(desc typDesc) sqlbase.Descriptor {
+			return *sqlbase.NewImmutableTypeDescriptor(desc).DescriptorProto()
+		}
+		typeExpr := "'hello'::@15 = 'hello'::@15"
+		typeArrExpr := "'hello'::@16 = 'hello'::@16"
+		descriptors = []sqlbase.Descriptor{
+			mkDB(0, "system"),
+			mkTable(tbDesc{ID: 1, Name: "foo", ParentID: 0}),
+			mkTable(tbDesc{ID: 2, Name: "bar", ParentID: 0}),
+			mkTable(tbDesc{ID: 4, Name: "baz", ParentID: 3}),
+			mkTable(tbDesc{ID: 6, Name: "offline", ParentID: 0, State: sqlbase.TableDescriptor_OFFLINE}),
+			mkDB(3, "data"),
+			mkDB(5, "empty"),
+			// Create some user defined types and tables that reference them.
+			mkDB(7, "udts"),
+			// Type descriptors represent different kinds of types. ENUM means
+			// that the type descriptor references an enum type. ALIAS means that
+			// the descriptor is a type alias for an existing type. ALIAS is only
+			// used for managing the implicit array type for each user defined type.
+			// Every user defined type also has an ALIAS type that represents an
+			// array of the user defined type, and that is tracked by the ArrayTypeID
+			// field on the type descriptor.
+			mkTyp(sqlbase.TypeDescriptor{ParentID: 7, ID: 8, Name: "enum1", ArrayTypeID: 9, Kind: sqlbase.TypeDescriptor_ENUM}),
+			mkTyp(sqlbase.TypeDescriptor{ParentID: 7, ID: 9, Name: "_enum1", Kind: sqlbase.TypeDescriptor_ALIAS, Alias: types.MakeEnum(8, 9)}),
+			mkTable(sqlbase.TableDescriptor{ParentID: 7, ID: 10, Name: "enum_tbl", Columns: []sqlbase.ColumnDescriptor{{ID: 0, Type: types.MakeEnum(8, 9)}}}),
+			mkTable(sqlbase.TableDescriptor{ParentID: 7, ID: 11, Name: "enum_arr_tbl", Columns: []sqlbase.ColumnDescriptor{{ID: 0, Type: types.MakeArray(types.MakeEnum(8, 9))}}}),
+			mkTyp(sqlbase.TypeDescriptor{ParentID: 7, ID: 12, Name: "enum2", ArrayTypeID: 13, Kind: sqlbase.TypeDescriptor_ENUM}),
+			mkTyp(sqlbase.TypeDescriptor{ParentID: 7, ID: 13, Name: "_enum2", Kind: sqlbase.TypeDescriptor_ALIAS, Alias: types.MakeEnum(12, 13)}),
+			// Create some user defined types that are used in table expressions.
+			mkDB(14, "udts_expr"),
+			mkTyp(sqlbase.TypeDescriptor{ParentID: 14, ID: 15, Name: "enum1", ArrayTypeID: 16, Kind: sqlbase.TypeDescriptor_ENUM}),
+			mkTyp(sqlbase.TypeDescriptor{ParentID: 14, ID: 16, Name: "_enum1", Kind: sqlbase.TypeDescriptor_ALIAS, Alias: types.MakeEnum(15, 16)}),
+			// Create a table with a default expression.
+			mkTable(tbDesc{
+				ID:       17,
+				Name:     "def",
+				ParentID: 14,
+				Columns: []sqlbase.ColumnDescriptor{
+					{
+						Name:        "a",
+						DefaultExpr: &typeExpr,
+						Type:        types.Bool,
+					},
+				},
+			}),
+			// Create a table with a computed column.
+			mkTable(tbDesc{
+				ID:       18,
+				Name:     "comp",
+				ParentID: 14,
+				Columns: []sqlbase.ColumnDescriptor{
+					{
+						Name:        "a",
+						DefaultExpr: &typeExpr,
+						Type:        types.Bool,
+					},
+				},
+			}),
+			// Create a table with a partial index.
+			mkTable(tbDesc{
+				ID:       19,
+				Name:     "pi",
+				ParentID: 14,
+				Indexes: []sqlbase.IndexDescriptor{
+					{
+						Name:      "idx",
+						Predicate: typeExpr,
+					},
+				},
+			}),
+			// Create a table with a check expression.
+			mkTable(tbDesc{
+				ID:       20,
+				Name:     "checks",
+				ParentID: 14,
+				Checks: []*sqlbase.TableDescriptor_CheckConstraint{
+					{
+						Expr: typeExpr,
+					},
+				},
+			}),
+			mkTable(tbDesc{
+				ID:       21,
+				Name:     "def_arr",
+				ParentID: 14,
+				Columns: []sqlbase.ColumnDescriptor{
+					{
+						Name:        "a",
+						DefaultExpr: &typeArrExpr,
+						Type:        types.Bool,
+					},
+				},
+			}),
+		}
 	}
 
 	tests := []struct {
@@ -91,13 +198,28 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 
 		{"", "TABLE SyStEm.FoO", []string{"system", "foo"}, nil, ``},
 		{"", "TABLE SyStEm.pUbLic.FoO", []string{"system", "foo"}, nil, ``},
+		{"", `TABLE system."FoO"`, nil, nil, `table "system.FoO" does not exist`},
+		{"system", `TABLE "FoO"`, nil, nil, `table "FoO" does not exist`},
 
 		{"", `TABLE system."foo"`, []string{"system", "foo"}, nil, ``},
 		{"", `TABLE system.public."foo"`, []string{"system", "foo"}, nil, ``},
 		{"system", `TABLE "foo"`, []string{"system", "foo"}, nil, ``},
-		// TODO(dan): Enable these tests once #8862 is fixed.
-		// {"", `TABLE system."FOO"`, []string{"system"}},
-		// {"system", `TABLE "FOO"`, []string{"system"}},
+
+		{"system", `TABLE offline`, nil, nil, `table "offline" does not exist`},
+		{"", `TABLE system.offline`, []string{"system", "foo"}, nil, `table "system.public.offline" does not exist`},
+		{"system", `TABLE *`, []string{"system", "foo", "bar"}, nil, ``},
+		// If we backup udts, then all tables and types (even unused) should be present.
+		{"", "DATABASE udts", []string{"udts", "enum1", "_enum1", "enum2", "_enum2", "enum_tbl", "enum_arr_tbl"}, []string{"udts"}, ``},
+		// Backing up enum_tbl should pull in both the enum and its array type.
+		{"", "TABLE udts.enum_tbl", []string{"udts", "enum1", "_enum1", "enum_tbl"}, nil, ``},
+		// Backing up enum_arr_tbl should also pull in both the enum and its array type.
+		{"", "TABLE udts.enum_arr_tbl", []string{"udts", "enum1", "_enum1", "enum_arr_tbl"}, nil, ``},
+		// Test collecting expressions that are present in table expressions.
+		{"", "TABLE udts_expr.def", []string{"udts_expr", "enum1", "_enum1", "def"}, nil, ``},
+		{"", "TABLE udts_expr.def_arr", []string{"udts_expr", "enum1", "_enum1", "def_arr"}, nil, ``},
+		{"", "TABLE udts_expr.comp", []string{"udts_expr", "enum1", "_enum1", "comp"}, nil, ``},
+		{"", "TABLE udts_expr.pi", []string{"udts_expr", "enum1", "_enum1", "pi"}, nil, ``},
+		{"", "TABLE udts_expr.checks", []string{"udts_expr", "enum1", "_enum1", "checks"}, nil, ``},
 	}
 	searchPath := sessiondata.MakeSearchPath([]string{"public", "pg_catalog"})
 	for i, test := range tests {
@@ -107,9 +229,9 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			targets := stmt.(*tree.Grant).Targets
+			targets := stmt.AST.(*tree.Grant).Targets
 
-			matched, err := descriptorsMatchingTargets(context.TODO(),
+			matched, err := descriptorsMatchingTargets(context.Background(),
 				test.sessionDatabase, searchPath, descriptors, targets)
 			if test.err != "" {
 				if !testutils.IsError(err, test.err) {

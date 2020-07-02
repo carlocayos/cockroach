@@ -1,35 +1,34 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package base
 
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/dustin/go-humanize"
-	"github.com/pkg/errors"
-	"github.com/spf13/pflag"
-
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil"
+	"github.com/cockroachdb/errors"
+	humanize "github.com/dustin/go-humanize"
+	"github.com/spf13/pflag"
 )
 
 // This file implements method receivers for members of server.Config struct
@@ -165,6 +164,12 @@ type StoreSpec struct {
 	Size       SizeSpec
 	InMemory   bool
 	Attributes roachpb.Attributes
+	// StickyInMemoryEngineID is a unique identifier associated with a given
+	// store which will remain in memory even after the default Engine close
+	// until it has been explicitly cleaned up by CleanupStickyInMemEngine[s]
+	// or the process has been terminated.
+	// This only applies to in-memory storage engine.
+	StickyInMemoryEngineID string
 	// UseFileRegistry is true if the "file registry" store version is desired.
 	// This is set by CCL code when encryption-at-rest is in use.
 	UseFileRegistry bool
@@ -197,7 +202,7 @@ func (ss StoreSpec) String() string {
 			if i != 0 {
 				fmt.Fprint(&buffer, ":")
 			}
-			fmt.Fprintf(&buffer, attr)
+			buffer.WriteString(attr)
 		}
 		fmt.Fprintf(&buffer, ",")
 	}
@@ -354,6 +359,60 @@ func (ssl StoreSpecList) String() string {
 	return buffer.String()
 }
 
+// AuxiliaryDir is the path of the auxiliary dir relative to an engine.Engine's
+// root directory. It must not be changed without a proper migration.
+const AuxiliaryDir = "auxiliary"
+
+// PreventedStartupFile is the filename (relative to 'dir') used for files that
+// can block server startup.
+func PreventedStartupFile(dir string) string {
+	return filepath.Join(dir, "_CRITICAL_ALERT.txt")
+}
+
+// PriorCriticalAlertError attempts to read the
+// PreventedStartupFile for each store directory and returns their
+// contents as a structured error.
+//
+// These files typically request operator intervention after a
+// corruption event by preventing the affected node(s) from starting
+// back up.
+func (ssl StoreSpecList) PriorCriticalAlertError() (err error) {
+	addError := func(newErr error) {
+		if err == nil {
+			err = errors.New("startup forbidden by prior critical alert")
+		}
+		// We use WithDetailf here instead of errors.CombineErrors
+		// because we want the details to be printed to the screen
+		// (combined errors only show up via %+v).
+		err = errors.WithDetailf(err, "%v", newErr)
+	}
+	for _, ss := range ssl.Specs {
+		path := ss.PreventedStartupFile()
+		if path == "" {
+			continue
+		}
+		b, err := ioutil.ReadFile(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				addError(errors.Wrapf(err, "%s", path))
+			}
+			continue
+		}
+		addError(errors.Newf("From %s:\n\n%s\n", path, b))
+	}
+	return err
+}
+
+// PreventedStartupFile returns the path to a file which, if it exists, should
+// prevent the server from starting up. Returns an empty string for in-memory
+// engines.
+func (ss StoreSpec) PreventedStartupFile() string {
+	if ss.InMemory {
+		return ""
+	}
+	return PreventedStartupFile(filepath.Join(ss.Path, AuxiliaryDir))
+}
+
 // Type returns the underlying type in string form. This is part of pflag's
 // value interface.
 func (ssl *StoreSpecList) Type() string {
@@ -403,6 +462,26 @@ func (jls *JoinListType) Type() string {
 // Set adds a new value to the JoinListType. It is the important part of
 // pflag's value interface.
 func (jls *JoinListType) Set(value string) error {
-	*jls = append(*jls, value)
+	if strings.TrimSpace(value) == "" {
+		// No value, likely user error.
+		return errors.New("no address specified in --join")
+	}
+	for _, v := range strings.Split(value, ",") {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			// --join=a,,b  equivalent to --join=a,b
+			continue
+		}
+		// Try splitting the address. This validates the format
+		// of the address and tolerates a missing delimiter colon
+		// between the address and port number.
+		addr, port, err := netutil.SplitHostPort(v, "")
+		if err != nil {
+			return err
+		}
+		// Re-join the parts. This guarantees an address that
+		// will be valid for net.SplitHostPort().
+		*jls = append(*jls, net.JoinHostPort(addr, port))
+	}
 	return nil
 }

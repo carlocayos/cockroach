@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -39,8 +35,9 @@ func TestScatterRandomizeLeases(t *testing.T) {
 	}
 
 	const numHosts = 3
+
 	tc := serverutils.StartTestCluster(t, numHosts, base.TestClusterArgs{})
-	defer tc.Stopper().Stop(context.TODO())
+	defer tc.Stopper().Stop(context.Background())
 
 	sqlutils.CreateTable(
 		t, tc.ServerConn(0), "t",
@@ -51,11 +48,15 @@ func TestScatterRandomizeLeases(t *testing.T) {
 
 	r := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 
+	// Even though we disabled merges via the store testing knob, we must also
+	// disable the setting in order for manual splits to be allowed.
+	r.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue_enabled = false")
+
 	// Introduce 99 splits to get 100 ranges.
 	r.Exec(t, "ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
 
 	getLeaseholders := func() (map[int]int, error) {
-		rows := r.Query(t, `SELECT range_id, lease_holder FROM [SHOW EXPERIMENTAL_RANGES FROM TABLE test.t]`)
+		rows := r.Query(t, `SELECT range_id, lease_holder FROM [SHOW RANGES FROM TABLE test.t]`)
 		leaseholders := make(map[int]int)
 		numRows := 0
 		for ; rows.Next(); numRows++ {
@@ -119,7 +120,7 @@ func TestScatterResponse(t *testing.T) {
 		1000,
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowModuloFn(10)),
 	)
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", "t")
+	tableDesc := sqlbase.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	r := sqlutils.MakeSQLRunner(sqlDB)
 	r.Exec(t, "ALTER TABLE test.t SPLIT AT (SELECT i*10 FROM generate_series(1, 99) AS g(i))")
@@ -134,10 +135,10 @@ func TestScatterResponse(t *testing.T) {
 		}
 		var expectedKey roachpb.Key
 		if i == 0 {
-			expectedKey = keys.MakeTablePrefix(uint32(tableDesc.ID))
+			expectedKey = keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.ID))
 		} else {
 			var err error
-			expectedKey, err = sqlbase.MakePrimaryIndexKey(tableDesc, i*10)
+			expectedKey, err = sqlbase.TestingMakePrimaryIndexKey(tableDesc, i*10)
 			if err != nil {
 				t.Fatal(err)
 			}

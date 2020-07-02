@@ -1,22 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
+// +build !fast_int_set_small,!fast_int_set_large
 
 package util
 
 import (
-	"bytes"
-	"fmt"
 	"math/bits"
 
 	"golang.org/x/tools/container/intsets"
@@ -200,6 +196,22 @@ func (s FastIntSet) Copy() FastIntSet {
 	return c
 }
 
+// CopyFrom sets the receiver to a copy of other, which can then be modified
+// independently.
+func (s *FastIntSet) CopyFrom(other FastIntSet) {
+	if other.large != nil {
+		if s.large == nil {
+			s.large = new(intsets.Sparse)
+		}
+		s.large.Copy(other.large)
+	} else {
+		s.small = other.small
+		if s.large != nil {
+			s.large.Clear()
+		}
+	}
+}
+
 // UnionWith adds all the elements from rhs to this set.
 func (s *FastIntSet) UnionWith(rhs FastIntSet) {
 	if s.large == nil && rhs.large == nil {
@@ -212,7 +224,13 @@ func (s *FastIntSet) UnionWith(rhs FastIntSet) {
 		s.large = s.toLarge()
 		s.small = 0
 	}
-	s.large.UnionWith(rhs.toLarge())
+	if rhs.large == nil {
+		for i, ok := rhs.Next(0); ok; i, ok = rhs.Next(i + 1) {
+			s.large.Insert(i)
+		}
+	} else {
+		s.large.UnionWith(rhs.large)
+	}
 }
 
 // Union returns the union of s and rhs as a new set.
@@ -351,44 +369,4 @@ func (s *FastIntSet) Shift(delta int) FastIntSet {
 		result.Add(i + delta)
 	})
 	return result
-}
-
-// String returns a list representation of elements. Sequential runs of positive
-// numbers are shown as ranges. For example, for the set {0, 1, 2, 5, 6, 10},
-// the output is "(0-2,5,6,10)".
-func (s FastIntSet) String() string {
-	var buf bytes.Buffer
-	buf.WriteByte('(')
-	appendRange := func(start, end int) {
-		if buf.Len() > 1 {
-			buf.WriteByte(',')
-		}
-		if start == end {
-			fmt.Fprintf(&buf, "%d", start)
-		} else if start+1 == end {
-			fmt.Fprintf(&buf, "%d,%d", start, end)
-		} else {
-			fmt.Fprintf(&buf, "%d-%d", start, end)
-		}
-	}
-	rangeStart, rangeEnd := -1, -1
-	s.ForEach(func(i int) {
-		if i < 0 {
-			appendRange(i, i)
-			return
-		}
-		if rangeStart != -1 && rangeEnd == i-1 {
-			rangeEnd = i
-		} else {
-			if rangeStart != -1 {
-				appendRange(rangeStart, rangeEnd)
-			}
-			rangeStart, rangeEnd = i, i
-		}
-	})
-	if rangeStart != -1 {
-		appendRange(rangeStart, rangeEnd)
-	}
-	buf.WriteByte(')')
-	return buf.String()
 }

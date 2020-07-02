@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
@@ -209,7 +205,7 @@ func TestRollupBasic(t *testing.T) {
 		Columnar:                tm.DB.WriteColumnar(),
 	}
 	if err := tm.DB.rollupTimeSeries(
-		context.TODO(),
+		context.Background(),
 		[]timeSeriesResolutionInfo{
 			{
 				Name:       "test.othermetric",
@@ -226,7 +222,7 @@ func TestRollupBasic(t *testing.T) {
 	}
 
 	if err := tm.DB.pruneTimeSeries(
-		context.TODO(),
+		context.Background(),
 		tm.DB.db,
 		[]timeSeriesResolutionInfo{
 			{
@@ -277,8 +273,8 @@ func TestRollupMemoryConstraint(t *testing.T) {
 		math.MaxInt64,
 		cluster.MakeTestingClusterSettings(),
 	)
-	adjustedMon.Start(context.TODO(), tm.workerMemMonitor, mon.BoundAccount{})
-	defer adjustedMon.Stop(context.TODO())
+	adjustedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
+	defer adjustedMon.Stop(context.Background())
 
 	// Roll up time series with the new monitor to measure high-water mark
 	// of
@@ -322,8 +318,8 @@ func TestRollupMemoryConstraint(t *testing.T) {
 		tm.assertKeyCount(51 + i /* rollups from previous iterations */ + 50)
 
 		// Restart monitor to clear query memory options.
-		adjustedMon.Stop(context.TODO())
-		adjustedMon.Start(context.TODO(), tm.workerMemMonitor, mon.BoundAccount{})
+		adjustedMon.Stop(context.Background())
+		adjustedMon.Start(context.Background(), tm.workerMemMonitor, mon.BoundAccount{})
 
 		qmc := MakeQueryMemoryContext(&adjustedMon, &adjustedMon, QueryMemoryOptions{
 			// Large budget, but not maximum to avoid overflows.

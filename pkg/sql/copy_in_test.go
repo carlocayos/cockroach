@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql_test
 
@@ -21,15 +17,20 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
+	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/lib/pq"
 )
 
@@ -38,7 +39,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -50,14 +51,16 @@ func TestCopyNullInfNaN(t *testing.T) {
 			b BYTES NULL,
 			d DATE NULL,
 			t TIME NULL,
-			ttz TIMETZ NULL,
+			ttz TIME NULL,
 			ts TIMESTAMP NULL,
 			n INTERVAL NULL,
 			o BOOL NULL,
 			e DECIMAL NULL,
 			u UUID NULL,
 			ip INET NULL,
-			tz TIMESTAMP WITH TIME ZONE NULL
+			tz TIMESTAMPTZ NULL,
+			geography GEOGRAPHY NULL,
+			geometry GEOMETRY NULL
 		);
 	`); err != nil {
 		t.Fatal(err)
@@ -68,16 +71,18 @@ func TestCopyNullInfNaN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyIn("t", "i", "f", "s", "b", "d", "t", "ttz", "ts", "n", "o", "e", "u", "ip", "tz"))
+	stmt, err := txn.Prepare(pq.CopyIn(
+		"t", "i", "f", "s", "b", "d", "t", "ttz",
+		"ts", "n", "o", "e", "u", "ip", "tz", "geography", "geometry"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	input := [][]interface{}{
-		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
-		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.Inf(-1), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
+		{nil, math.NaN(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil},
 	}
 
 	for _, in := range input {
@@ -126,14 +131,14 @@ func TestCopyNullInfNaN(t *testing.T) {
 	}
 }
 
-// TestCopyRandom inserts 100 random rows using COPY and ensures the SELECT'd
+// TestCopyRandom inserts random rows using COPY and ensures the SELECT'd
 // data is the same.
 func TestCopyRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -151,7 +156,9 @@ func TestCopyRandom(t *testing.T) {
 			b BYTES,
 			u UUID,
 			ip INET,
-			tz TIMESTAMP WITH TIME ZONE
+			tz TIMESTAMPTZ,
+			geography GEOGRAPHY NULL,
+			geometry GEOMETRY NULL
 		);
 		SET extra_float_digits = 3; -- to preserve floats entirely
 	`); err != nil {
@@ -163,41 +170,47 @@ func TestCopyRandom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz"))
+	stmt, err := txn.Prepare(pq.CopyInSchema("d", "t", "id", "n", "o", "i", "f", "e", "t", "ttz", "ts", "s", "b", "u", "ip", "tz", "geography", "geometry"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rng := rand.New(rand.NewSource(0))
-	types := []sqlbase.ColumnType_SemanticType{
-		sqlbase.ColumnType_INT,
-		sqlbase.ColumnType_INTERVAL,
-		sqlbase.ColumnType_BOOL,
-		sqlbase.ColumnType_INT,
-		sqlbase.ColumnType_FLOAT,
-		sqlbase.ColumnType_DECIMAL,
-		sqlbase.ColumnType_TIME,
-		sqlbase.ColumnType_TIMETZ,
-		sqlbase.ColumnType_TIMESTAMP,
-		sqlbase.ColumnType_STRING,
-		sqlbase.ColumnType_BYTES,
-		sqlbase.ColumnType_UUID,
-		sqlbase.ColumnType_INET,
-		sqlbase.ColumnType_TIMESTAMPTZ,
+	typs := []*types.T{
+		types.Int,
+		types.Interval,
+		types.Bool,
+		types.Int,
+		types.Float,
+		types.Decimal,
+		types.Time,
+		types.TimeTZ,
+		types.Timestamp,
+		types.String,
+		types.Bytes,
+		types.Uuid,
+		types.INet,
+		types.TimestampTZ,
+		types.Geography,
+		types.Geometry,
 	}
 
 	var inputs [][]interface{}
 
-	for i := 0; i < 100; i++ {
-		row := make([]interface{}, len(types))
-		for j, t := range types {
+	for i := 0; i < 1000; i++ {
+		row := make([]interface{}, len(typs))
+		for j, t := range typs {
 			var ds string
 			if j == 0 {
 				// Special handling for ID field
 				ds = strconv.Itoa(i)
 			} else {
-				d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: t}, false)
+				d := sqlbase.RandDatum(rng, t, false)
 				ds = tree.AsStringWithFlags(d, tree.FmtBareStrings)
+				switch t {
+				case types.Float:
+					ds = strings.TrimSuffix(ds, ".0")
+				}
 			}
 			row[j] = ds
 		}
@@ -243,12 +256,12 @@ func TestCopyRandom(t *testing.T) {
 				ds = string(d)
 			case time.Time:
 				var dt tree.NodeFormatter
-				if types[i] == sqlbase.ColumnType_TIME {
-					dt = tree.MakeDTime(timeofday.FromTime(d))
-				} else if types[i] == sqlbase.ColumnType_TIMETZ {
-					dt = tree.MakeDTimeTZ(timeofday.FromTime(d), d.Location())
+				if typs[i].Family() == types.TimeFamily {
+					dt = tree.MakeDTime(timeofday.FromTimeAllow2400(d))
+				} else if typs[i].Family() == types.TimeTZFamily {
+					dt = tree.NewDTimeTZ(timetz.MakeTimeTZFromTimeAllow2400(d))
 				} else {
-					dt = tree.MakeDTimestamp(d, time.Microsecond)
+					dt = tree.MustMakeDTimestamp(d, time.Microsecond)
 				}
 				ds = tree.AsStringWithFlags(dt, tree.FmtBareStrings)
 			}
@@ -264,7 +277,7 @@ func TestCopyError(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -319,7 +332,7 @@ func TestCopyOne(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -353,7 +366,7 @@ func TestCopyInProgress(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -386,7 +399,7 @@ func TestCopyTransaction(t *testing.T) {
 
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -430,5 +443,47 @@ func TestCopyTransaction(t *testing.T) {
 	}
 	if err := txn.Commit(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCopyFKCheck verifies that foreign keys are checked during COPY.
+func TestCopyFKCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	params, _ := tests.CreateTestServerParams()
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+
+	db.SetMaxOpenConns(1)
+	r := sqlutils.MakeSQLRunner(db)
+	r.Exec(t, `
+		CREATE DATABASE d;
+		SET DATABASE = d;
+		CREATE TABLE p (p INT PRIMARY KEY);
+		CREATE TABLE t (
+		  a INT PRIMARY KEY,
+		  p INT REFERENCES p(p)
+		);
+	`)
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txn.Rollback() }()
+
+	stmt, err := txn.Prepare(pq.CopyIn("t", "a", "p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = stmt.Exec(1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = stmt.Close()
+	if !testutils.IsError(err, "foreign key violation|violates foreign key constraint") {
+		t.Fatalf("expected FK error, got: %v", err)
 	}
 }

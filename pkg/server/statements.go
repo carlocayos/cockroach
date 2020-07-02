@@ -1,16 +1,12 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package server
 
@@ -18,12 +14,12 @@ import (
 	"context"
 	"fmt"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func (s *statusServer) Statements(
@@ -32,9 +28,14 @@ func (s *statusServer) Statements(
 	ctx = propagateGatewayMetadata(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
+	if _, err := s.admin.requireAdminUser(ctx); err != nil {
+		return nil, err
+	}
+
 	response := &serverpb.StatementsResponse{
-		Statements: []serverpb.StatementsResponse_CollectedStatementStatistics{},
-		LastReset:  timeutil.Now(),
+		Statements:            []serverpb.StatementsResponse_CollectedStatementStatistics{},
+		LastReset:             timeutil.Now(),
+		InternalAppNamePrefix: sqlbase.InternalAppNamePrefix,
 	}
 
 	localReq := &serverpb.StatementsRequest{
@@ -56,11 +57,17 @@ func (s *statusServer) Statements(
 		return status.Statements(ctx, localReq)
 	}
 
-	nodeStatement := func(ctx context.Context, status serverpb.StatusClient) (interface{}, error) {
+	dialFn := func(ctx context.Context, nodeID roachpb.NodeID) (interface{}, error) {
+		client, err := s.dialNode(ctx, nodeID)
+		return client, err
+	}
+	nodeStatement := func(ctx context.Context, client interface{}, _ roachpb.NodeID) (interface{}, error) {
+		status := client.(serverpb.StatusClient)
 		return status.Statements(ctx, localReq)
 	}
 
 	if err := s.iterateNodes(ctx, fmt.Sprintf("statement statistics for node %s", req.NodeID),
+		dialFn,
 		nodeStatement,
 		func(nodeID roachpb.NodeID, resp interface{}) {
 			statementsResp := resp.(*serverpb.StatementsResponse)
@@ -80,12 +87,13 @@ func (s *statusServer) Statements(
 }
 
 func (s *statusServer) StatementsLocal(ctx context.Context) (*serverpb.StatementsResponse, error) {
-	stmtStats := s.admin.server.pgServer.SQLServer.GetUnscrubbedStmtStats()
-	lastReset := s.admin.server.pgServer.SQLServer.GetStmtStatsLastReset()
+	stmtStats := s.admin.server.sqlServer.pgServer.SQLServer.GetUnscrubbedStmtStats()
+	lastReset := s.admin.server.sqlServer.pgServer.SQLServer.GetStmtStatsLastReset()
 
 	resp := &serverpb.StatementsResponse{
-		Statements: make([]serverpb.StatementsResponse_CollectedStatementStatistics, len(stmtStats)),
-		LastReset:  lastReset,
+		Statements:            make([]serverpb.StatementsResponse_CollectedStatementStatistics, len(stmtStats)),
+		LastReset:             lastReset,
+		InternalAppNamePrefix: sqlbase.InternalAppNamePrefix,
 	}
 
 	for i, stmt := range stmtStats {

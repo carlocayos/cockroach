@@ -1,37 +1,40 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"strconv"
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
+
+type copyMachineInterface interface {
+	run(ctx context.Context) error
+}
 
 // copyMachine supports the Copy-in pgwire subprotocol (COPY...FROM STDIN). The
 // machine is created by the Executor when that statement is executed; from that
@@ -67,9 +70,9 @@ type copyMachine struct {
 	// conn is the pgwire connection from which data is to be read.
 	conn pgwirebase.Conn
 
-	// resetPlanner is a function to be used to prepare the planner for inserting
-	// data.
-	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time)
+	// execInsertPlan is a function to be used to execute the plan (stored in the
+	// planner) which performs an INSERT.
+	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error
 
 	txnOpt copyTxnOpt
 
@@ -81,6 +84,8 @@ type copyMachine struct {
 	// parsing. Is it not correctly initialized with timestamps, transactions and
 	// other things that statements more generally need.
 	parsingEvalCtx *tree.EvalContext
+
+	processRows func(ctx context.Context) error
 }
 
 // newCopyMachine creates a new copyMachine.
@@ -90,47 +95,52 @@ func newCopyMachine(
 	n *tree.CopyFrom,
 	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
-	resetPlanner func(p *planner, txn *client.Txn, txnTS time.Time, stmtTS time.Time),
+	execInsertPlan func(ctx context.Context, p *planner, res RestrictedCommandResult) error,
 ) (_ *copyMachine, retErr error) {
 	c := &copyMachine{
-		conn:    conn,
+		conn: conn,
+		// TODO(georgiah): Currently, insertRows depends on Table and Columns,
+		//  but that dependency can be removed by refactoring it.
 		table:   &n.Table,
 		columns: n.Columns,
 		txnOpt:  txnOpt,
 		// The planner will be prepared before use.
-		p:            planner{execCfg: execCfg},
-		resetPlanner: resetPlanner,
+		p:              planner{execCfg: execCfg, alloc: &sqlbase.DatumAlloc{}},
+		execInsertPlan: execInsertPlan,
 	}
-	c.resetPlanner(&c.p, nil /* txn */, time.Time{} /* txnTS */, time.Time{} /* stmtTS */)
-	c.parsingEvalCtx = c.p.EvalContext()
 
-	cleanup := c.preparePlanner(ctx)
+	// We need a planner to do the initial planning, in addition
+	// to those used for the main execution of the COPY afterwards.
+	cleanup := c.p.preparePlannerForCopy(ctx, txnOpt)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
+	c.parsingEvalCtx = c.p.EvalContext()
 
-	tn, err := n.Table.Normalize()
-	if err != nil {
-		return nil, err
-	}
-	tableDesc, err := ResolveExistingObject(ctx, &c.p, tn, true /*required*/, requireTableDesc)
+	tableDesc, err := resolver.ResolveExistingTableObject(ctx, &c.p, &n.Table, tree.ObjectLookupFlagsWithRequired(), resolver.ResolveRequireTableDesc)
 	if err != nil {
 		return nil, err
 	}
 	if err := c.p.CheckPrivilege(ctx, tableDesc, privilege.INSERT); err != nil {
 		return nil, err
 	}
-	cols, err := c.p.processColumns(tableDesc, n.Columns,
+	cols, err := sqlbase.ProcessTargetColumns(tableDesc, n.Columns,
 		true /* ensureColumns */, false /* allowMutations */)
 	if err != nil {
 		return nil, err
 	}
 	c.resultColumns = make(sqlbase.ResultColumns, len(cols))
-	for i, col := range cols {
-		c.resultColumns[i] = sqlbase.ResultColumn{Typ: col.Type.ToDatumType()}
+	for i := range cols {
+		c.resultColumns[i] = sqlbase.ResultColumn{
+			Name:           cols[i].Name,
+			Typ:            cols[i].Type,
+			TableID:        tableDesc.GetID(),
+			PGAttributeNum: cols[i].GetLogicalColumnID(),
+		}
 	}
 	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
 	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
+	c.processRows = c.insertRows
 	return c, nil
 }
 
@@ -142,9 +152,10 @@ type copyTxnOpt struct {
 	// performed. Committing the txn is left to the higher layer.  If not set, the
 	// machine will split writes between multiple transactions that it will
 	// initiate.
-	txn           *client.Txn
+	txn           *kv.Txn
 	txnTimestamp  time.Time
 	stmtTimestamp time.Time
+	resetPlanner  func(ctx context.Context, p *planner, txn *kv.Txn, txnTS time.Time, stmtTS time.Time)
 }
 
 // run consumes all the copy-in data from the network connection and inserts it
@@ -183,7 +194,7 @@ Loop:
 			}
 			break Loop
 		case pgwirebase.ClientMsgCopyFail:
-			return fmt.Errorf("client canceled COPY")
+			return errors.Newf("client canceled COPY")
 		case pgwirebase.ClientMsgFlush, pgwirebase.ClientMsgSync:
 			// Spec says to "ignore Flush and Sync messages received during copy-in mode".
 		default:
@@ -262,34 +273,39 @@ func (c *copyMachine) processCopyData(
 		}
 	}
 	// Only do work if we have a full batch of rows or this is the end.
-	if ln := len(c.rows); ln == 0 || (ln < copyBatchRowSize && !final) {
+	if ln := len(c.rows); !final && (ln == 0 || ln < copyBatchRowSize) {
 		return nil
 	}
-	return c.insertRows(ctx)
+	return c.processRows(ctx)
 }
 
-// preparePlanner resets the planner so that it can be used for execution.
-// Depending on how the machine was configured, a new transaction might be
-// created.
+// preparePlannerForCopy resets the planner so that it can be used during
+// a COPY operation (either COPY to table, or COPY to file).
 //
-// It returns a cleanup function that needs to be called when we're done with
-// the planner (before preparePlanner is called again). The cleanup function
-// commits the txn (if it hasn't already been committed) or rolls it back
-// depending on whether it is passed an error. If an error is passed in to the
-// cleanup function, the same error is returned.
-func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, error) error {
-	txn := c.txnOpt.txn
-	txnTs := c.txnOpt.txnTimestamp
-	stmtTs := c.txnOpt.stmtTimestamp
+// Depending on how the requesting COPY machine was configured, a new
+// transaction might be created.
+//
+// It returns a cleanup function that needs to be called when we're
+// done with the planner (before preparePlannerForCopy is called
+// again). The cleanup function commits the txn (if it hasn't already
+// been committed) or rolls it back depending on whether it is passed
+// an error. If an error is passed in to the cleanup function, the
+// same error is returned.
+func (p *planner) preparePlannerForCopy(
+	ctx context.Context, txnOpt copyTxnOpt,
+) func(context.Context, error) error {
+	txn := txnOpt.txn
+	txnTs := txnOpt.txnTimestamp
+	stmtTs := txnOpt.stmtTimestamp
 	autoCommit := false
 	if txn == nil {
-		txn = client.NewTxn(c.p.execCfg.DB, c.p.execCfg.NodeID.Get(), client.RootTxn)
-		txnTs = c.p.execCfg.Clock.PhysicalTime()
+		txn = kv.NewTxnWithSteppingEnabled(ctx, p.execCfg.DB, p.execCfg.NodeID.Get())
+		txnTs = p.execCfg.Clock.PhysicalTime()
 		stmtTs = txnTs
 		autoCommit = true
 	}
-	c.resetPlanner(&c.p, txn, txnTs, stmtTs)
-	c.p.autoCommit = autoCommit
+	txnOpt.resetPlanner(ctx, p, txn, txnTs, stmtTs)
+	p.autoCommit = autoCommit
 
 	return func(ctx context.Context, err error) error {
 		if err == nil {
@@ -308,7 +324,10 @@ func (c *copyMachine) preparePlanner(ctx context.Context) func(context.Context, 
 
 // insertRows transforms the buffered rows into an insertNode and executes it.
 func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
-	cleanup := c.preparePlanner(ctx)
+	if len(c.rows) == 0 {
+		return nil
+	}
+	cleanup := c.p.preparePlannerForCopy(ctx, c.txnOpt)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
@@ -319,7 +338,8 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 	c.rows = c.rows[:0]
 	c.rowsMemAcc.Clear(ctx)
 
-	in := tree.Insert{
+	c.p.stmt = &Statement{}
+	c.p.stmt.AST = &tree.Insert{
 		Table:   c.table,
 		Columns: c.columns,
 		Rows: &tree.Select{
@@ -327,29 +347,24 @@ func (c *copyMachine) insertRows(ctx context.Context) (retErr error) {
 		},
 		Returning: tree.AbsentReturningClause,
 	}
-	insertNode, err := c.p.Insert(ctx, &in, nil /* desiredTypes */)
-	if err != nil {
+	if err := c.p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
-	defer insertNode.Close(ctx)
 
-	params := runParams{
-		ctx:             ctx,
-		extendedEvalCtx: &c.p.extendedEvalCtx,
-		p:               &c.p,
-	}
-	if err := startPlan(params, insertNode); err != nil {
-		return err
-	}
-	rows, err := countRowsAffected(params, insertNode)
+	var res bufferedCommandResult
+	err := c.execInsertPlan(ctx, &c.p, &res)
 	if err != nil {
 		return err
 	}
-	if rows != numRows {
-		log.Fatalf(params.ctx, "didn't insert all buffered rows and yet no error was reported. "+
+	if err := res.Err(); err != nil {
+		return err
+	}
+
+	if rows := res.RowsAffected(); rows != numRows {
+		log.Fatalf(ctx, "didn't insert all buffered rows and yet no error was reported. "+
 			"Inserted %d out of %d rows.", rows, numRows)
 	}
-	c.insertedRows += rows
+	c.insertedRows += numRows
 
 	return nil
 }
@@ -358,7 +373,8 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 	var err error
 	parts := bytes.Split(line, fieldDelim)
 	if len(parts) != len(c.resultColumns) {
-		return fmt.Errorf("expected %d values, got %d", len(c.resultColumns), len(parts))
+		return pgerror.Newf(pgcode.ProtocolViolation,
+			"expected %d values, got %d", len(c.resultColumns), len(parts))
 	}
 	exprs := make(tree.Exprs, len(parts))
 	for i, part := range parts {
@@ -367,21 +383,21 @@ func (c *copyMachine) addRow(ctx context.Context, line []byte) error {
 			exprs[i] = tree.DNull
 			continue
 		}
-		switch t := c.resultColumns[i].Typ; t {
-		case types.Bytes,
-			types.Date,
-			types.Interval,
-			types.INet,
-			types.String,
-			types.Timestamp,
-			types.TimestampTZ,
-			types.UUID:
+		switch t := c.resultColumns[i].Typ; t.Family() {
+		case types.BytesFamily,
+			types.DateFamily,
+			types.IntervalFamily,
+			types.INetFamily,
+			types.StringFamily,
+			types.TimestampFamily,
+			types.TimestampTZFamily,
+			types.UuidFamily:
 			s, err = decodeCopy(s)
 			if err != nil {
 				return err
 			}
 		}
-		d, err := tree.ParseStringAs(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
+		d, err := sqlbase.ParseDatumStringAsWithRawBytes(c.resultColumns[i].Typ, s, c.parsingEvalCtx)
 		if err != nil {
 			return err
 		}
@@ -414,7 +430,8 @@ func decodeCopy(in string) (string, error) {
 		buf.WriteString(in[start:i])
 		i++
 		if i >= n {
-			return "", fmt.Errorf("unknown escape sequence: %q", in[i-1:])
+			return "", pgerror.Newf(pgcode.Syntax,
+				"unknown escape sequence: %q", in[i-1:])
 		}
 
 		ch := in[i]
@@ -424,12 +441,14 @@ func decodeCopy(in string) (string, error) {
 			// \x can be followed by 1 or 2 hex digits.
 			i++
 			if i >= n {
-				return "", fmt.Errorf("unknown escape sequence: %q", in[i-2:])
+				return "", pgerror.Newf(pgcode.Syntax,
+					"unknown escape sequence: %q", in[i-2:])
 			}
 			ch = in[i]
 			digit, ok := decodeHexDigit(ch)
 			if !ok {
-				return "", fmt.Errorf("unknown escape sequence: %q", in[i-2:i])
+				return "", pgerror.Newf(pgcode.Syntax,
+					"unknown escape sequence: %q", in[i-2:i])
 			}
 			if i+1 < n {
 				if v, ok := decodeHexDigit(in[i+1]); ok {
@@ -458,7 +477,8 @@ func decodeCopy(in string) (string, error) {
 			}
 			buf.WriteByte(digit)
 		} else {
-			return "", fmt.Errorf("unknown escape sequence: %q", in[i-1:i+1])
+			return "", pgerror.Newf(pgcode.Syntax,
+				"unknown escape sequence: %q", in[i-1:i+1])
 		}
 		start = i + 1
 	}

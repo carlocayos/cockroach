@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package jobs_test
 
@@ -26,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -37,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestRoundtripJob(t *testing.T) {
@@ -70,7 +67,7 @@ func TestRoundtripJob(t *testing.T) {
 
 func TestRegistryResumeExpiredLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer jobs.ResetResumeHooks()()
+	defer jobs.ResetConstructors()()
 
 	ctx := context.Background()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
@@ -86,14 +83,15 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		const cancelInterval = time.Duration(math.MaxInt64)
 		const adoptInterval = time.Nanosecond
 
+		var c base.NodeIDContainer
+		c.Set(ctx, id)
+		idContainer := base.NewSQLIDContainer(0, &c, true /* exposed */)
 		ac := log.AmbientContext{Tracer: tracing.NewTracer()}
-		nodeID := &base.NodeIDContainer{}
-		nodeID.Reset(id)
 		r := jobs.MakeRegistry(
-			ac, clock, db, s.InternalExecutor().(sqlutil.InternalExecutor),
-			nodeID, s.ClusterSettings(), jobs.FakePHS,
+			ac, s.Stopper(), clock, sqlbase.MakeOptionalNodeLiveness(nodeLiveness), db, s.InternalExecutor().(sqlutil.InternalExecutor),
+			idContainer, s.ClusterSettings(), base.DefaultHistogramWindowInterval(), jobs.FakePHS, "",
 		)
-		if err := r.Start(ctx, s.Stopper(), nodeLiveness, cancelInterval, adoptInterval); err != nil {
+		if err := r.Start(ctx, s.Stopper(), cancelInterval, adoptInterval); err != nil {
 			t.Fatal(err)
 		}
 		return r
@@ -126,26 +124,38 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 	// receive on it will block until a job is running.
 	resumeCalled := make(chan struct{})
 	var lock syncutil.Mutex
-	jobs.AddResumeHook(func(_ jobspb.Type, _ *cluster.Settings) jobs.Resumer {
+	jobs.RegisterConstructor(jobspb.TypeBackup, func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 		lock.Lock()
 		hookCallCount++
 		lock.Unlock()
-		return jobs.FakeResumer{OnResume: func(job *jobs.Job) error {
-			select {
-			case resumeCalled <- struct{}{}:
-			case <-done:
-			}
-			lock.Lock()
-			resumeCounts[*job.ID()]++
-			lock.Unlock()
-			<-done
-			return nil
-		}}
+		return jobs.FakeResumer{
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case resumeCalled <- struct{}{}:
+				case <-done:
+				}
+				lock.Lock()
+				resumeCounts[*job.ID()]++
+				lock.Unlock()
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-done:
+					return nil
+				}
+			},
+		}
 	})
 
 	for i := 0; i < jobCount; i++ {
 		nodeid := roachpb.NodeID(i + 1)
-		job, _, err := newRegistry(nodeid).StartJob(ctx, nil, jobs.Record{Details: jobspb.BackupDetails{}, Progress: jobspb.BackupProgress{}})
+		rec := jobs.Record{
+			Details:  jobspb.BackupDetails{},
+			Progress: jobspb.BackupProgress{},
+		}
+		job, _, err := newRegistry(nodeid).CreateAndStartJob(ctx, nil, rec)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -234,12 +244,18 @@ func TestRegistryResumeActiveLease(t *testing.T) {
 	jobs.DefaultAdoptInterval = 100 * time.Millisecond
 
 	resumeCh := make(chan int64)
-	defer jobs.ResetResumeHooks()()
-	jobs.AddResumeHook(func(_ jobspb.Type, _ *cluster.Settings) jobs.Resumer {
-		return jobs.FakeResumer{OnResume: func(job *jobs.Job) error {
-			resumeCh <- *job.ID()
-			return nil
-		}}
+	defer jobs.ResetConstructors()()
+	jobs.RegisterConstructor(jobspb.TypeBackup, func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
+		return jobs.FakeResumer{
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case resumeCh <- *job.ID():
+					return nil
+				}
+			},
+		}
 	})
 
 	ctx := context.Background()

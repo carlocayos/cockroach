@@ -1,25 +1,25 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // expressionCarrier handles visiting sub-expressions.
@@ -46,54 +46,44 @@ type tableWriter interface {
 
 	// init provides the tableWriter with a Txn and optional monitor to write to
 	// and returns an error if it was misconfigured.
-	init(*client.Txn, *tree.EvalContext) error
+	init(context.Context, *kv.Txn, *tree.EvalContext) error
 
 	// row performs a sql row modification (tableInserter performs an insert,
 	// etc). It batches up writes to the init'd txn and periodically sends them.
-	// The passed Datums is not used after `row` returns. The returned Datums is
-	// suitable for use with returningHelper.
+	//
+	// The passed Datums is not used after `row` returns.
+	//
+	// The ignoreIndexes parameter is a set of IndexIDs to avoid updating when
+	// performing the row modification. It is necessary to avoid writing to
+	// partial indexes when rows do not satisfy the partial index predicate.
+	//
 	// The traceKV parameter determines whether the individual K/V operations
 	// should be logged to the context. We use a separate argument here instead
 	// of a Value field on the context because Value access in context.Context
 	// is rather expensive and the tableWriter interface is used on the
 	// inner loop of table accesses.
-	row(context.Context, tree.Datums, bool /* traceKV */) (tree.Datums, error)
+	row(context.Context, tree.Datums, util.FastIntSet /* ignoreIndexes */, bool /* traceKV */) error
 
 	// finalize flushes out any remaining writes. It is called after all calls to
 	// row.  It returns a slice of all Datums not yet returned by calls to `row`.
 	// The traceKV parameter determines whether the individual K/V operations
 	// should be logged to the context. See the comment above for why
 	// this a separate parameter as opposed to a Value field on the context.
-	//
-	// autoCommit specifies whether the tableWriter is free to commit the txn in
-	// which it was operating once all writes are performed.
-	finalize(
-		ctx context.Context, autoCommit autoCommitOpt, traceKV bool,
-	) (*sqlbase.RowContainer, error)
+	finalize(ctx context.Context, traceKV bool) (*rowcontainer.RowContainer, error)
 
 	// tableDesc returns the TableDescriptor for the table that the tableWriter
 	// will modify.
-	tableDesc() *sqlbase.TableDescriptor
-
-	// fkSpanCollector returns the FkSpanCollector for the tableWriter.
-	fkSpanCollector() sqlbase.FkSpanCollector
+	tableDesc() *sqlbase.ImmutableTableDescriptor
 
 	// close frees all resources held by the tableWriter.
 	close(context.Context)
-}
 
-type autoCommitOpt int
+	// desc returns a name suitable for describing the table writer in
+	// the output of EXPLAIN.
+	desc() string
 
-const (
-	noAutoCommit autoCommitOpt = iota
-	autoCommitEnabled
-)
-
-// extendedTableWriter is a temporary interface introduced
-// until all the tableWriters implement it. When that is achieved, it will be merged into
-// the main tableWriter interface.
-type extendedTableWriter interface {
-	tableWriter
+	// enable auto commit in call to finalize().
+	enableAutoCommit()
 
 	// atBatchEnd is called at the end of each batch, just before
 	// finalize/flush. It can utilize the current KV batch which is
@@ -113,47 +103,53 @@ type extendedTableWriter interface {
 	curBatchSize() int
 }
 
-var _ extendedTableWriter = (*tableUpdater)(nil)
-var _ extendedTableWriter = (*tableDeleter)(nil)
-var _ extendedTableWriter = (*tableInserter)(nil)
+type autoCommitOpt int
+
+const (
+	autoCommitDisabled autoCommitOpt = 0
+	autoCommitEnabled  autoCommitOpt = 1
+)
 
 // tableWriterBase is meant to be used to factor common code between
 // the other tableWriters.
 type tableWriterBase struct {
 	// txn is the current KV transaction.
-	txn *client.Txn
+	txn *kv.Txn
+	// is autoCommit turned on.
+	autoCommit autoCommitOpt
 	// b is the current batch.
-	b *client.Batch
+	b *kv.Batch
 	// batchSize is the current batch size (when known).
 	batchSize int
 }
 
-func (tb *tableWriterBase) init(txn *client.Txn) {
+func (tb *tableWriterBase) init(txn *kv.Txn) {
 	tb.txn = txn
 	tb.b = txn.NewBatch()
 }
 
-// flushAndStartNewBatch shares the common flushAndStartNewBatch()
-// code between extendedTableWriters.
+// flushAndStartNewBatch shares the common flushAndStartNewBatch() code between
+// tableWriters.
 func (tb *tableWriterBase) flushAndStartNewBatch(
-	ctx context.Context, tableDesc *sqlbase.TableDescriptor,
+	ctx context.Context, tableDesc *sqlbase.ImmutableTableDescriptor,
 ) error {
 	if err := tb.txn.Run(ctx, tb.b); err != nil {
-		return sqlbase.ConvertBatchError(ctx, tableDesc, tb.b)
+		return row.ConvertBatchError(ctx, tableDesc, tb.b)
 	}
 	tb.b = tb.txn.NewBatch()
 	tb.batchSize = 0
 	return nil
 }
 
-// curBatchSize shares the common curBatchSize() code between extendedTableWriters().
+// curBatchSize shares the common curBatchSize() code between tableWriters.
 func (tb *tableWriterBase) curBatchSize() int { return tb.batchSize }
 
-// finalize shares the common finalize code between extendedTableWriters.
+// finalize shares the common finalize() code between tableWriters.
 func (tb *tableWriterBase) finalize(
-	ctx context.Context, autoCommit autoCommitOpt, tableDesc *sqlbase.TableDescriptor,
+	ctx context.Context, tableDesc *sqlbase.ImmutableTableDescriptor,
 ) (err error) {
-	if autoCommit == autoCommitEnabled {
+	if tb.autoCommit == autoCommitEnabled {
+		log.Event(ctx, "autocommit enabled")
 		// An auto-txn can commit the transaction with the batch. This is an
 		// optimization to avoid an extra round-trip to the transaction
 		// coordinator.
@@ -163,23 +159,11 @@ func (tb *tableWriterBase) finalize(
 	}
 
 	if err != nil {
-		return sqlbase.ConvertBatchError(ctx, tableDesc, tb.b)
+		return row.ConvertBatchError(ctx, tableDesc, tb.b)
 	}
 	return nil
 }
 
-// batchedTableWriter is used for tableWriters that
-// do their work at the end of the current batch, currently
-// used for tableUpserter.
-type batchedTableWriter interface {
-	extendedTableWriter
-
-	// batchedCount returns the number of results in the current batch.
-	batchedCount() int
-
-	// batchedValues accesses one row in the current batch.
-	batchedValues(rowIdx int) tree.Datums
+func (tb *tableWriterBase) enableAutoCommit() {
+	tb.autoCommit = autoCommitEnabled
 }
-
-var _ batchedTableWriter = (*tableUpserter)(nil)
-var _ batchedTableWriter = (*fastTableUpserter)(nil)

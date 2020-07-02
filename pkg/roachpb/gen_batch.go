@@ -1,16 +1,12 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 // This file generates batch_generated.go. It can be run via:
 //    go run -tags gen-batch gen_batch.go
@@ -153,9 +149,9 @@ func main() {
 package roachpb
 
 import (
-	"bytes"
 	"fmt"
 	"strconv"
+	"strings"
 )
 `)
 
@@ -230,25 +226,33 @@ var requestNames = []string{`)
 	fmt.Fprint(f, `
 // Summary prints a short summary of the requests in a batch.
 func (ba *BatchRequest) Summary() string {
+	var b strings.Builder
+	ba.WriteSummary(&b)
+	return b.String()
+}
+
+// WriteSummary writes a short summary of the requests in a batch
+// to the provided builder.
+func (ba *BatchRequest) WriteSummary(b *strings.Builder) {
 	if len(ba.Requests) == 0 {
-		return "empty batch"
+		b.WriteString("empty batch")
+		return
 	}
 	counts := ba.getReqCounts()
-	var buf struct {
-		bytes.Buffer
-		tmp [10]byte
-	}
+	var tmp [10]byte
+	var comma bool
 	for i, v := range counts {
 		if v != 0 {
-			if buf.Len() > 0 {
-				buf.WriteString(", ")
+			if comma {
+				b.WriteString(", ")
 			}
-			buf.Write(strconv.AppendInt(buf.tmp[:0], int64(v), 10))
-			buf.WriteString(" ")
-			buf.WriteString(requestNames[i])
+			comma = true
+
+			b.Write(strconv.AppendInt(tmp[:0], int64(v), 10))
+			b.WriteString(" ")
+			b.WriteString(requestNames[i])
 		}
 	}
-	return buf.String()
 }
 `)
 

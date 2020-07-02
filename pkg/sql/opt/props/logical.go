@@ -1,47 +1,19 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package props
 
 import (
-	"bytes"
-	"fmt"
-	"strings"
-	"unicode"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 )
-
-// Logical properties describe the content and characteristics of data returned
-// by all expression variants within a memo group. While each expression in the
-// group may return rows or columns in a different order, or compute the result
-// using different algorithms, the same set of data is returned and can then be
-// transformed into whatever layout or presentation format that is desired,
-// according to the required physical properties.
-type Logical struct {
-	// Relational contains the set of properties that describe relational
-	// operators, like select, join, and project. It is nil for scalar
-	// operators.
-	Relational *Relational
-
-	// Scalar contains the set of properties that describe scalar operators,
-	// like And, Plus, and Const. It is nil for relational operators.
-	Scalar *Scalar
-}
 
 // AvailableRuleProps is a bit set that indicates when lazily-populated Rule
 // properties are initialized and ready for use.
@@ -59,49 +31,121 @@ const (
 	// field is populated.
 	InterestingOrderings
 
+	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
+	// is populated.
+	HasHoistableSubquery
+
 	// UnfilteredCols is set when the Relational.Rule.UnfilteredCols field is
 	// populated.
 	UnfilteredCols
 
-	// HasHoistableSubquery is set when the Scalar.Rule.HasHoistableSubquery
-	// is populated.
-	HasHoistableSubquery
+	// JoinSize is set when the Relational.Rule.JoinSize field is populated.
+	JoinSize
+
+	// WithUses is set when the Shared.Rule.WithUses field is populated.
+	WithUses
 )
 
-// Relational properties are the subset of logical properties that are computed
-// for relational expressions that return rows and columns rather than scalar
-// values.
-type Relational struct {
-	// OutputCols is the set of columns that can be projected by the
-	// expression. Ordering, naming, and duplication of columns is not
-	// representable by this property; those are physical properties.
-	OutputCols opt.ColSet
-
-	// NotNullCols is the subset of output columns which cannot be NULL.
-	// The NULL-ability of columns flows from the inputs and can also be
-	// derived from filters that are NULL-intolerant.
-	NotNullCols opt.ColSet
+// Shared are properties that are shared by both relational and scalar
+// expressions.
+type Shared struct {
+	// Populated is set to true once the properties have been built for the
+	// operator.
+	Populated bool
 
 	// OuterCols is the set of columns that are referenced by variables within
-	// this relational sub-expression, but are not bound within the scope of
-	// the expression. For example:
+	// this sub-expression, but are not bound within the scope of the expression.
+	// For example:
 	//
 	//   SELECT *
 	//   FROM a
 	//   WHERE EXISTS(SELECT * FROM b WHERE b.x = a.x AND b.y = 5)
 	//
-	// For the inner SELECT expression, a.x is an outer column, meaning that it
-	// is defined "outside" the SELECT expression (hence the name "outer"). The
-	// SELECT expression binds the b.x and b.y references, so they are not
-	// part of the outer column set. The outer SELECT binds the a.x column, and
-	// so its outer column set is empty.
+	// For the EXISTS expression, a.x is an outer column, meaning that it is
+	// defined "outside" the EXISTS expression (hence the name "outer"). The
+	// SELECT expression binds the b.x and b.y references, so they are not part
+	// of the outer column set. The outer SELECT binds the a.x column, and so
+	// its outer column set is empty.
+	//
+	// Note that what constitutes an "outer column" is dependent on an
+	// expression's location in the query. For example, while the b.x and b.y
+	// columns are not outer columns on the EXISTS expression, they *are* outer
+	// columns on the inner WHERE condition.
 	OuterCols opt.ColSet
 
-	// CanHaveSideEffects is true if the subtree rooted at this expression might
-	// trigger a run-time error, might modify outside state, or might not always
-	// return the same output given the same input. For more details, see the
-	// comment for Logical.CanHaveSideEffects.
-	CanHaveSideEffects bool
+	// HasSubquery is true if the subtree rooted at this node contains a subquery.
+	// The subquery can be a Subquery, Exists, Any, or ArrayFlatten expression.
+	// Subqueries are the only place where a relational node can be nested within a
+	// scalar expression.
+	HasSubquery bool
+
+	// HasCorrelatedSubquery is true if the scalar expression tree contains a
+	// subquery having one or more outer columns. The subquery can be a Subquery,
+	// Exists, or Any operator. These operators usually need to be hoisted out of
+	// scalar expression trees and turned into top-level apply joins. This
+	// property makes detection fast and easy so that the hoister doesn't waste
+	// time searching subtrees that don't contain subqueries.
+	HasCorrelatedSubquery bool
+
+	// VolatilitySet contains the set of volatilities contained in the expression.
+	VolatilitySet VolatilitySet
+
+	// CanMutate is true if the subtree rooted at this expression contains at
+	// least one operator that modifies schema (like CreateTable) or writes or
+	// deletes rows (like Insert).
+	CanMutate bool
+
+	// HasPlaceholder is true if the subtree rooted at this expression contains
+	// at least one Placeholder operator.
+	HasPlaceholder bool
+
+	// Rule props are lazily calculated and typically only apply to a single
+	// rule. See the comment above Relational.Rule for more details.
+	Rule struct {
+		// WithUses tracks information about the WithScans inside the given
+		// expression which reference WithIDs outside of that expression.
+		WithUses WithUsesMap
+	}
+}
+
+// WithUsesMap stores information about each WithScan referencing an outside
+// WithID, grouped by each WithID.
+type WithUsesMap map[opt.WithID]WithUseInfo
+
+// WithUseInfo contains information about the usage of a specific WithID.
+type WithUseInfo struct {
+	// Count is the number of WithScan operators which reference this WithID.
+	Count int
+
+	// UsedCols is the union of columns used by all WithScan operators which
+	// reference this WithID.
+	UsedCols opt.ColSet
+}
+
+// Relational properties describe the content and characteristics of relational
+// data returned by all expression variants within a memo group. While each
+// expression in the group may return rows or columns in a different order, or
+// compute the result using different algorithms, the same set of data is
+// returned and can then be  transformed into whatever layout or presentation
+// format that is desired, according to the required physical properties.
+type Relational struct {
+	Shared
+
+	// OutputCols is the set of columns that can be projected by the expression.
+	// Ordering, naming, and duplication of columns is not representable by this
+	// property; those are physical properties.
+	OutputCols opt.ColSet
+
+	// NotNullCols is the subset of output columns which cannot be NULL. The
+	// nullability of columns flows from the inputs and can also be derived from
+	// filters that reject nulls.
+	NotNullCols opt.ColSet
+
+	// Cardinality is the number of rows that can be returned from this relational
+	// expression. The number of rows will always be between the inclusive Min and
+	// Max bounds. If Max=math.MaxUint32, then there is no limit to the number of
+	// rows returned by the expression.
+	Cardinality Cardinality
 
 	// FuncDepSet is a set of functional dependencies (FDs) that encode useful
 	// relationships between columns in a base or derived relation. Given two sets
@@ -127,12 +171,6 @@ type Relational struct {
 	//
 	// For more details, see the header comment for FuncDepSet.
 	FuncDeps FuncDepSet
-
-	// Cardinality is the number of rows that can be returned from this relational
-	// expression. The number of rows will always be between the inclusive Min and
-	// Max bounds. If Max=math.MaxUint32, then there is no limit to the number of
-	// rows returned by the expression.
-	Cardinality Cardinality
 
 	// Stats is the set of statistics that apply to this relational expression.
 	// See statistics.go and memo/statistics_builder.go for more details.
@@ -225,62 +263,44 @@ type Relational struct {
 		// been set.
 		InterestingOrderings opt.OrderingSet
 
-		// UnfilteredCols is the set of output columns that have values for every
-		// row in their owner table. Rows may be duplicated, but no rows can be
-		// missing. For example, an unconstrained, unlimited Scan operator can
-		// add all of its output columns to this property, but a Select operator
-		// cannot add any columns, as it may have filtered rows.
+		// UnfilteredCols is the set of all columns for which rows from their base
+		// table are guaranteed not to have been filtered. Rows may be duplicated,
+		// but no rows can be missing. Even columns which are not output columns are
+		// included as long as table rows are guaranteed not filtered. For example,
+		// an unconstrained, unlimited Scan operator can add all columns from its
+		// table to this property, but a Select operator cannot add any columns, as
+		// it may have filtered rows.
 		//
-		// UnfilteredCols is lazily populated by the SimplifyLeftJoinWithFilters
-		// and SimplifyRightJoinWithFilters rules. It is only valid once the
-		// Rule.Available.UnfilteredCols bit has been set.
+		// UnfilteredCols is lazily populated by GetJoinMultiplicityFromInputs. It
+		// is only valid once the Rule.Available.UnfilteredCols bit has been set.
 		UnfilteredCols opt.ColSet
+
+		// JoinSize is the number of relations being *inner* joined underneath
+		// this node. It is used to only reorder joins via AssociateJoin up to
+		// a certain limit.
+		JoinSize int
 	}
 }
 
-// Scalar properties are the subset of logical properties that are computed for
-// scalar expressions that return primitive-valued types.
+// Scalar properties are logical properties that are computed for scalar
+// expressions that return primitive-valued types. Scalar properties are
+// lazily populated on request.
 type Scalar struct {
-	// Type is the data type of the scalar expression (int, string, etc).
-	Type types.T
-
-	// OuterCols is the set of columns that are referenced by variables within
-	// this scalar sub-expression, but are not bound within the scope of the
-	// expression. For example:
-	//
-	//   SELECT *
-	//   FROM a
-	//   WHERE EXISTS(SELECT * FROM b WHERE b.x = a.x AND b.y = 5)
-	//
-	// For the EXISTS expression, only a.x is an outer column, meaning that
-	// only it is defined "outside" the EXISTS expression (hence the name
-	// "outer"). Note that what constitutes an "outer column" is dependent on
-	// an expression's location in the query. For example, while the b.x and
-	// b.y columns are not outer columns on the EXISTS expression, they *are*
-	// outer columns on the inner WHERE condition.
-	OuterCols opt.ColSet
-
-	// CanHaveSideEffects is true if the subtree rooted at this expression might
-	// trigger a run-time error, might modify outside state, or might not always
-	// return the same output given the same input. For more details, see the
-	// comment for Logical.CanHaveSideEffects.
-	CanHaveSideEffects bool
+	Shared
 
 	// Constraints is the set of constraints deduced from a boolean expression.
 	// For the expression to be true, all constraints in the set must be
 	// satisfied.
-	// This field is populated lazily, as necessary.
 	Constraints *constraint.Set
 
 	// TightConstraints is true if the expression is exactly equivalent to the
 	// constraints. If it is false, the constraints are weaker than the
 	// expression.
-	// This field is populated lazily, as necessary.
 	TightConstraints bool
 
 	// FuncDeps is a set of functional dependencies (FDs) inferred from a
 	// boolean expression. This field is only populated for Filters expressions.
-	// FDs that can be inferred from Filters expressions include:
+	//
 	//  - Constant column FDs such as ()-->(1,2) from conjuncts such as
 	//    x = 5 AND y = 10.
 	//  - Equivalent column FDs such as (1)==(2), (2)==(1) from conjuncts such
@@ -349,234 +369,4 @@ func (s *Scalar) IsAvailable(p AvailableRuleProps) bool {
 // mark them as populated on this scalar properties instance.
 func (s *Scalar) SetAvailable(p AvailableRuleProps) {
 	s.Rule.Available |= p
-}
-
-// OuterCols is a helper method that returns either the relational or scalar
-// OuterCols field, depending on the operator's type.
-func (p *Logical) OuterCols() opt.ColSet {
-	if p.Scalar != nil {
-		return p.Scalar.OuterCols
-	}
-	return p.Relational.OuterCols
-}
-
-// CanHaveSideEffects is true if the expression modifies state outside its own
-// scope, or if depends upon state that may change across evaluations. An
-// expression can have side effects if it can do any of the following:
-//
-//   1. Trigger a run-time error
-//        10 / col                           -- division by zero error possible
-//        crdb_internal.force_error('', '')  -- triggers run-time error
-//
-//   2. Modify outside session or database state
-//        nextval(seq)                -- modifies database sequence value
-//        SELECT * FROM [INSERT ...]  -- inserts rows into database
-//
-//   3. Return different results when repeatedly called with same input
-//        ORDER BY random()       -- random can return different values
-//        ts < clock_timestamp()  -- clock_timestamp can return different values
-//
-// The optimizer makes *only* the following side-effect related guarantees:
-//
-//   1. CASE/IF branches are only evaluated if the branch condition is true.
-//      Therefore, the following is guaranteed to never raise a divide by zero
-//      error, regardless of how cleverly the optimizer rewrites the expression:
-//
-//        CASE WHEN divisor<>0 THEN dividend / divisor ELSE NULL END
-//
-//      While this example is trivial, a more complex example might have
-//      correlated subqueries that cannot be hoisted outside the CASE expression
-//      in the usual way, since that would trigger premature evaluation.
-//
-//   2. Expressions with side effects are never treated as constant expressions,
-//      even though they do not depend on other columns in the query:
-//
-//        SELECT * FROM xy ORDER BY random()
-//
-//      If the random() expression were treated as a constant, then the ORDER BY
-//      could be dropped by the optimizer, since ordering by a constant is a
-//      no-op. Instead, the optimizer treats it like it would an expression that
-//      depends upon a column.
-//
-//   3. A common table expression (CTE) with side effects will only be evaluated
-//      one time. This will typically prevent inlining of the CTE into the query
-//      body. For example:
-//
-//        WITH a AS (INSERT ... RETURNING ...) SELECT * FROM a, a
-//
-//      Although the "a" CTE is referenced twice, it must be evaluated only one
-//      time (and its results cached to satisfy the second reference).
-//
-// As long as the optimizer provides these guarantees, it is free to rewrite,
-// reorder, duplicate, and eliminate as if no side effects were present. As an
-// example, the optimizer is free to eliminate the unused "nextval" column in
-// this query:
-//
-//   SELECT x FROM (SELECT nextval(seq), x FROM xy)
-//   =>
-//   SELECT x FROM xy
-//
-// It's also allowed to duplicate side-effecting expressions during predicate
-// pushdown:
-//
-//   SELECT * FROM xy INNER JOIN xz ON xy.x=xz.x WHERE xy.x=random()
-//   =>
-//   SELECT *
-//   FROM (SELECT * FROM xy WHERE xy.x=random())
-//   INNER JOIN (SELECT * FROM xz WHERE xz.x=random())
-//   ON xy.x=xz.x
-//
-func (p *Logical) CanHaveSideEffects() bool {
-	if p.Scalar != nil {
-		return p.Scalar.CanHaveSideEffects
-	}
-	return p.Relational.CanHaveSideEffects
-}
-
-// Verify runs consistency checks against the logical properties, in order to
-// ensure that they conform to several invariants:
-//
-//   1. Functional dependencies are internally consistent.
-//   2. Not null columns are a subset of output columns.
-//   3. Outer columns do not intersect output columns.
-//   4. If functional dependencies indicate that the relation can have at most
-//      one row, then the cardinality reflects that as well.
-//
-func (p *Logical) Verify() {
-	scalar := p.Scalar
-	if scalar != nil {
-		scalar.FuncDeps.Verify()
-
-		if p.Relational != nil {
-			panic("relational and scalar properties cannot both be set")
-		}
-		return
-	}
-
-	relational := p.Relational
-	relational.FuncDeps.Verify()
-
-	if !relational.NotNullCols.SubsetOf(relational.OutputCols) {
-		panic(fmt.Sprintf("not null cols %s not a subset of output cols %s",
-			relational.NotNullCols, relational.OutputCols))
-	}
-	if relational.OuterCols.Intersects(relational.OutputCols) {
-		panic(fmt.Sprintf("outer cols %s intersect output cols %s",
-			relational.OuterCols, relational.OutputCols))
-	}
-	if relational.FuncDeps.HasMax1Row() {
-		if relational.Cardinality.Max > 1 {
-			panic(fmt.Sprintf(
-				"max cardinality must be <= 1 if FDs have max 1 row: %s", relational.Cardinality))
-		}
-	}
-}
-
-// FormatColSet outputs the specified set of columns using FormatCol to format
-// the output.
-func (p *Logical) FormatColSet(
-	f *opt.ExprFmtCtx, tp treeprinter.Node, heading string, colSet opt.ColSet,
-) {
-	if !colSet.Empty() {
-		var buf bytes.Buffer
-		buf.WriteString(heading)
-		colSet.ForEach(func(i int) {
-			p.FormatCol(f, &buf, "", opt.ColumnID(i))
-		})
-		tp.Child(buf.String())
-	}
-}
-
-// FormatColList outputs the specified list of columns using FormatCol to
-// format the output.
-func (p *Logical) FormatColList(
-	f *opt.ExprFmtCtx, tp treeprinter.Node, heading string, colList opt.ColList,
-) {
-	if len(colList) > 0 {
-		var buf bytes.Buffer
-		buf.WriteString(heading)
-		for _, col := range colList {
-			p.FormatCol(f, &buf, "", col)
-		}
-		tp.Child(buf.String())
-	}
-}
-
-// FormatCol outputs the specified column using the following format:
-//   label:index(type)
-//
-// If the column is not nullable, then this is the format:
-//   label:index(type!null)
-//
-// If a label is given, then it is used. Otherwise, a "best effort" label is
-// used from query metadata.
-func (p *Logical) FormatCol(f *opt.ExprFmtCtx, buf *bytes.Buffer, label string, id opt.ColumnID) {
-	if label == "" {
-		label = f.Metadata().ColumnLabel(id)
-	}
-
-	if !isSimpleColumnName(label) {
-		// Add quotations around the column name if it appears to be an
-		// expression. This also indicates that the column name is not eligible
-		// to be shortened.
-		label = "\"" + label + "\""
-	} else if f.HasFlags(opt.ExprFmtHideQualifications) {
-		// If the label is qualified, try to shorten it.
-		if idx := strings.LastIndex(label, "."); idx != -1 {
-			short := label[idx+1:]
-			suffix := label[idx:] // includes the "."
-			// Check if shortening the label could cause ambiguity: is there another
-			// column that would be shortened to the same name?
-			ambiguous := false
-			for col := opt.ColumnID(1); int(col) <= f.Metadata().NumColumns(); col++ {
-				if col != id {
-					if l := f.Metadata().ColumnLabel(col); l == short || strings.HasSuffix(l, suffix) {
-						ambiguous = true
-						break
-					}
-				}
-			}
-			if !ambiguous {
-				label = short
-			}
-		}
-	}
-
-	typ := f.Metadata().ColumnType(id)
-	buf.WriteByte(' ')
-	buf.WriteString(label)
-	buf.WriteByte(':')
-	fmt.Fprintf(buf, "%d", id)
-	buf.WriteByte('(')
-	buf.WriteString(typ.String())
-
-	if p.Relational.NotNullCols.Contains(int(id)) {
-		buf.WriteString("!null")
-	}
-	buf.WriteByte(')')
-}
-
-// isSimpleColumnName returns true if the given label consists of only ASCII
-// letters, numbers, underscores, quotation marks, and periods ("."). It is
-// used to determine whether or not we can shorten a column label by removing
-// the prefix up to the last ".". Although isSimpleColumnName excludes some
-// valid table column names, it ensures that we don't shorten expressions such
-// as "a.x + b.x" to "x". It is better to err on the side of not shortening
-// than to incorrectly shorten a column name representing an expression.
-func isSimpleColumnName(label string) bool {
-	for i, r := range label {
-		if r > unicode.MaxASCII {
-			return false
-		}
-
-		if i == 0 {
-			if r != '"' && !unicode.IsLetter(r) {
-				// The first character must be a letter or quotation mark.
-				return false
-			}
-		} else if r != '.' && r != '_' && r != '"' && !unicode.IsNumber(r) && !unicode.IsLetter(r) {
-			return false
-		}
-	}
-	return true
 }

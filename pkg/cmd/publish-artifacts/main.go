@@ -1,23 +1,18 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package main
 
 import (
 	"archive/tar"
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"flag"
@@ -35,7 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	version "github.com/hashicorp/go-version"
+	"github.com/cockroachdb/cockroach/pkg/release"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/kr/pretty"
 )
 
@@ -59,21 +55,6 @@ var testableS3 = func() (s3putter, error) {
 	}
 	return s3.New(sess), nil
 }
-
-var libsRe = func() *regexp.Regexp {
-	libs := strings.Join([]string{
-		regexp.QuoteMeta("linux-vdso.so."),
-		regexp.QuoteMeta("librt.so."),
-		regexp.QuoteMeta("libpthread.so."),
-		regexp.QuoteMeta("libdl.so."),
-		regexp.QuoteMeta("libtinfo.so."),
-		regexp.QuoteMeta("libncurses.so."),
-		regexp.QuoteMeta("libm.so."),
-		regexp.QuoteMeta("libc.so."),
-		strings.Replace(regexp.QuoteMeta("ld-linux-ARCH.so."), "ARCH", ".*", -1),
-	}, "|")
-	return regexp.MustCompile(libs)
-}()
 
 var osVersionRe = regexp.MustCompile(`\d+(\.\d+)*-`)
 
@@ -112,13 +93,13 @@ func main() {
 	var versionStr string
 	var isStableRelease bool
 	if *isRelease {
-		ver, err := version.NewVersion(branch)
+		ver, err := version.Parse(branch)
 		if err != nil {
 			log.Fatalf("refusing to build release with invalid version name '%s' (err: %s)", branch, err)
 		}
 
 		// Prerelease returns anything after the `-` and before metadata. eg: `beta` for `1.0.1-beta+metadata`
-		if ver.Prerelease() == "" {
+		if ver.PreRelease() == "" {
 			isStableRelease = true
 		}
 		versionStr = branch
@@ -162,18 +143,7 @@ func main() {
 		})
 	}
 
-	for _, target := range []struct {
-		buildType string
-		suffix    string
-	}{
-		// TODO(tamird): consider shifting this information into the builder
-		// image; it's conceivable that we'll want to target multiple versions
-		// of a given triple.
-		{buildType: "darwin", suffix: ".darwin-10.9-amd64"},
-		{buildType: "linux-gnu", suffix: ".linux-2.6.32-gnu-amd64"},
-		{buildType: "linux-musl", suffix: ".linux-2.6.32-musl-amd64"},
-		{buildType: "windows", suffix: ".windows-6.2-amd64.exe"},
-	} {
+	for _, target := range release.SupportedTargets {
 		for i, extraArgs := range []struct {
 			goflags string
 			suffix  string
@@ -194,9 +164,9 @@ func main() {
 			o.VersionStr = versionStr
 			o.BucketName = bucketName
 			o.Branch = branch
-			o.BuildType = target.buildType
+			o.BuildType = target.BuildType
 			o.GoFlags = extraArgs.goflags
-			o.Suffix = extraArgs.suffix + target.suffix
+			o.Suffix = extraArgs.suffix + target.Suffix
 			o.Tags = extraArgs.tags
 
 			log.Printf("building %s", pretty.Sprint(o))
@@ -204,12 +174,6 @@ func main() {
 			// TODO(tamird): build deadlock,race binaries for all targets?
 			if i > 0 && (*isRelease || !strings.HasSuffix(o.BuildType, "linux-gnu")) {
 				log.Printf("skipping auxiliary build")
-				continue
-			}
-			// race doesn't work without glibc on Linux. See
-			// https://github.com/golang/go/issues/14481.
-			if strings.HasSuffix(o.BuildType, "linux-musl") && strings.Contains(o.GoFlags, "-race") {
-				log.Printf("skipping race build for this configuration")
 				continue
 			}
 
@@ -268,65 +232,29 @@ func buildArchive(svc s3putter, o opts) {
 }
 
 func buildOneCockroach(svc s3putter, o opts) {
+	log.Printf("building cockroach %s", pretty.Sprint(o))
 	defer func() {
 		log.Printf("done building cockroach: %s", pretty.Sprint(o))
 	}()
 
-	{
-		args := []string{o.BuildType}
-		args = append(args, fmt.Sprintf("%s=%s", "GOFLAGS", o.GoFlags))
-		args = append(args, fmt.Sprintf("%s=%s", "SUFFIX", o.Suffix))
-		args = append(args, fmt.Sprintf("%s=%s", "TAGS", o.Tags))
-		args = append(args, fmt.Sprintf("%s=%s", "BUILDCHANNEL", "official-binary"))
-		if *isRelease {
-			args = append(args, fmt.Sprintf("%s=%s", "BUILD_TAGGED_RELEASE", "true"))
-		}
-		cmd := exec.Command("mkrelease", args...)
-		cmd.Dir = o.PkgDir
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		log.Printf("%s %s", cmd.Env, cmd.Args)
-		if err := cmd.Run(); err != nil {
-			log.Fatalf("%s: %s", cmd.Args, err)
-		}
+	opts := []release.MakeReleaseOption{
+		release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "GOFLAGS", o.GoFlags)),
+		release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "TAGS", o.Tags)),
+		release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "BUILDCHANNEL", "official-binary")),
+	}
+	if *isRelease {
+		opts = append(opts, release.WithMakeReleaseOptionBuildArg(fmt.Sprintf("%s=%s", "BUILD_TAGGED_RELEASE", "true")))
 	}
 
-	if strings.Contains(o.BuildType, "linux") {
-		binaryName := "./cockroach" + o.Suffix
-
-		cmd := exec.Command(binaryName, "version")
-		cmd.Dir = o.PkgDir
-		cmd.Env = append(cmd.Env, "MALLOC_CONF=prof:true")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		log.Printf("%s %s", cmd.Env, cmd.Args)
-		if err := cmd.Run(); err != nil {
-			log.Fatalf("%s %s: %s", cmd.Env, cmd.Args, err)
-		}
-
-		// ldd only works on binaries built for the host. "linux-musl"
-		// produces fully static binaries, which cause ldd to exit
-		// non-zero.
-		//
-		// TODO(tamird): implement this for all targets.
-		if !strings.HasSuffix(o.BuildType, "linux-musl") {
-			cmd := exec.Command("ldd", binaryName)
-			cmd.Dir = o.PkgDir
-			log.Printf("%s %s", cmd.Env, cmd.Args)
-			out, err := cmd.Output()
-			if err != nil {
-				log.Fatalf("%s: out=%q err=%s", cmd.Args, out, err)
-			}
-			scanner := bufio.NewScanner(bytes.NewReader(out))
-			for scanner.Scan() {
-				if line := scanner.Text(); !libsRe.MatchString(line) {
-					log.Fatalf("%s is not properly statically linked:\n%s", binaryName, out)
-				}
-			}
-			if err := scanner.Err(); err != nil {
-				log.Fatal(err)
-			}
-		}
+	if err := release.MakeRelease(
+		release.SupportedTarget{
+			BuildType: o.BuildType,
+			Suffix:    o.Suffix,
+		},
+		o.PkgDir,
+		opts...,
+	); err != nil {
+		log.Fatal(err)
 	}
 
 	o.Base = "cockroach" + o.Suffix
@@ -440,9 +368,9 @@ func putNonRelease(svc s3putter, o opts) {
 	}
 	latestKey := fmt.Sprintf("%s/%s.%s", repoName, remoteName, latestSuffix)
 	if _, err := svc.PutObject(&s3.PutObjectInput{
-		Bucket:       &o.BucketName,
-		CacheControl: &noCache,
-		Key:          &latestKey,
+		Bucket:                  &o.BucketName,
+		CacheControl:            &noCache,
+		Key:                     &latestKey,
 		WebsiteRedirectLocation: &versionKey,
 	}); err != nil {
 		log.Fatalf("s3 redirect to %s: %s", versionKey, err)

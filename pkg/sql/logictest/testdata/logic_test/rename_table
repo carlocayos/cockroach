@@ -1,5 +1,4 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
-
+# LogicTest: !3node-tenant
 statement error pgcode 42P01 relation "foo" does not exist
 ALTER TABLE foo RENAME TO bar
 
@@ -21,10 +20,10 @@ SELECT * FROM kv
 1 2
 3 4
 
-query T
+query TTT
 SHOW TABLES
 ----
-kv
+public  kv  table
 
 statement ok
 ALTER TABLE kv RENAME TO new_kv
@@ -38,10 +37,10 @@ SELECT * FROM new_kv
 1 2
 3 4
 
-query T
+query TTT
 SHOW TABLES
 ----
-new_kv
+public  new_kv  table
 
 # check the name in the descriptor, which is used by SHOW GRANTS, is also changed
 query TTTTT
@@ -97,11 +96,11 @@ GRANT CREATE ON DATABASE test TO testuser
 statement ok
 ALTER TABLE test.t RENAME TO t2
 
-query T
+query TTT
 SHOW TABLES
 ----
-new_kv
-t2
+public  new_kv  table
+public  t2      table
 
 user testuser
 
@@ -124,15 +123,15 @@ ALTER TABLE test.new_kv RENAME TO test2.t
 statement ok
 ALTER TABLE test.t2 RENAME TO test2.t2
 
-query T
+query TTT
 SHOW TABLES
 ----
 
-query T
+query TTT
 SHOW TABLES FROM test2
 ----
-t
-t2
+public  t   table
+public  t2  table
 
 user root
 
@@ -261,3 +260,24 @@ ROLLBACK
 
 statement error pgcode 42P01 relation \"d.kv2\" does not exist
 INSERT INTO d.kv2 (k,v) VALUES ('c', 'd')
+
+statement ok
+USE d
+
+query TTT
+SHOW TABLES
+----
+public  kv  table
+
+query TTT
+EXPLAIN ALTER TABLE kv RENAME TO kv2
+----
+·             distribution  local
+·             vectorized    false
+rename table  ·             ·
+
+# Verify that the EXPLAIN above does not actually rename the table (#30543)
+query TTT
+SHOW TABLES
+----
+public  kv  table

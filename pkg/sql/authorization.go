@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -19,20 +15,24 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
-type membershipCache struct {
+// MembershipCache is a shared cache for role membership information.
+type MembershipCache struct {
 	syncutil.Mutex
 	tableVersion sqlbase.DescriptorVersion
 	// userCache is a mapping from username to userRoleMembership.
 	userCache map[string]userRoleMembership
 }
-
-var roleMembersCache membershipCache
 
 // userRoleMembership is a mapping of "rolename" -> "with admin option".
 type userRoleMembership map[string]bool
@@ -41,15 +41,23 @@ type userRoleMembership map[string]bool
 type AuthorizationAccessor interface {
 	// CheckPrivilege verifies that the user has `privilege` on `descriptor`.
 	CheckPrivilege(
-		ctx context.Context, descriptor sqlbase.DescriptorProto, privilege privilege.Kind,
+		ctx context.Context, descriptor sqlbase.DescriptorInterface, privilege privilege.Kind,
 	) error
 
 	// CheckAnyPrivilege returns nil if user has any privileges at all.
-	CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.DescriptorProto) error
+	CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.DescriptorInterface) error
 
-	// RequiresSuperUser errors if the session user isn't a super-user (i.e. root
-	// or node). Includes the named action in the error message.
-	RequireSuperUser(ctx context.Context, action string) error
+	// HasAdminRole returns tuple of bool and error:
+	// (true, nil) means that the user has an admin role (i.e. root or node)
+	// (false, nil) means that the user has NO admin role
+	// (false, err) means that there was an error running the query on
+	// the `system.users` table
+	HasAdminRole(ctx context.Context) (bool, error)
+
+	// RequireAdminRole is a wrapper on top of HasAdminRole.
+	// It errors if HasAdminRole errors or if the user isn't a super-user.
+	// Includes the named action in the error message.
+	RequireAdminRole(ctx context.Context, action string) error
 
 	// MemberOfWithAdminOption looks up all the roles (direct and indirect) that 'member' is a member
 	// of and returns a map of role -> isAdmin.
@@ -58,22 +66,18 @@ type AuthorizationAccessor interface {
 
 var _ AuthorizationAccessor = &planner{}
 
-// CheckPrivilegeForUser verifies that `user`` has `privilege` on `descriptor`.
-// This is not part of the planner as the only caller (ccl/sqlccl/restore.go) does not have one.
-func CheckPrivilegeForUser(
-	_ context.Context, user string, descriptor sqlbase.DescriptorProto, privilege privilege.Kind,
-) error {
-	if descriptor.GetPrivileges().CheckPrivilege(user, privilege) {
-		return nil
-	}
-	return fmt.Errorf("user %s does not have %s privilege on %s %s",
-		user, privilege, descriptor.TypeName(), descriptor.GetName())
-}
-
 // CheckPrivilege implements the AuthorizationAccessor interface.
+// Requires a valid transaction to be open.
 func (p *planner) CheckPrivilege(
-	ctx context.Context, descriptor sqlbase.DescriptorProto, privilege privilege.Kind,
+	ctx context.Context, descriptor sqlbase.DescriptorInterface, privilege privilege.Kind,
 ) error {
+	// Verify that the txn is valid in any case, so that
+	// we don't get the risk to say "OK" to root requests
+	// with an invalid API usage.
+	if p.txn == nil || !p.txn.IsOpen() {
+		return errors.AssertionFailedf("cannot use CheckPrivilege without a txn")
+	}
+
 	// Test whether the object is being audited, and if so, record an
 	// audit event. We place this check here to increase the likelihood
 	// it will not be forgotten if features are added that access
@@ -107,12 +111,23 @@ func (p *planner) CheckPrivilege(
 		}
 	}
 
-	return fmt.Errorf("user %s does not have %s privilege on %s %s",
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s does not have %s privilege on %s %s",
 		user, privilege, descriptor.TypeName(), descriptor.GetName())
 }
 
 // CheckAnyPrivilege implements the AuthorizationAccessor interface.
-func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.DescriptorProto) error {
+// Requires a valid transaction to be open.
+func (p *planner) CheckAnyPrivilege(
+	ctx context.Context, descriptor sqlbase.DescriptorInterface,
+) error {
+	// Verify that the txn is valid in any case, so that
+	// we don't get the risk to say "OK" to root requests
+	// with an invalid API usage.
+	if p.txn == nil || !p.txn.IsOpen() {
+		return errors.AssertionFailedf("cannot use CheckAnyPrivilege without a txn")
+	}
+
 	user := p.SessionData().User
 	privs := descriptor.GetPrivileges()
 
@@ -139,45 +154,90 @@ func (p *planner) CheckAnyPrivilege(ctx context.Context, descriptor sqlbase.Desc
 		}
 	}
 
-	return fmt.Errorf("user %s has no privileges on %s %s",
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s has no privileges on %s %s",
 		p.SessionData().User, descriptor.TypeName(), descriptor.GetName())
 }
 
-// RequireSuperUser implements the AuthorizationAccessor interface.
-func (p *planner) RequireSuperUser(ctx context.Context, action string) error {
+// HasAdminRole implements the AuthorizationAccessor interface.
+// Requires a valid transaction to be open.
+func (p *planner) HasAdminRole(ctx context.Context) (bool, error) {
 	user := p.SessionData().User
+	if user == "" {
+		return false, errors.AssertionFailedf("empty user")
+	}
+	// Verify that the txn is valid in any case, so that
+	// we don't get the risk to say "OK" to root requests
+	// with an invalid API usage.
+	if p.txn == nil || !p.txn.IsOpen() {
+		return false, errors.AssertionFailedf("cannot use HasAdminRole without a txn")
+	}
 
 	// Check if user is 'root' or 'node'.
+	// TODO(knz): planner HasAdminRole has no business authorizing
+	// the "node" principal - node should not be issuing SQL queries.
 	if user == security.RootUser || user == security.NodeUser {
-		return nil
+		return true, nil
 	}
 
 	// Expand role memberships.
 	memberOf, err := p.MemberOfWithAdminOption(ctx, user)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Check is 'user' is a member of role 'admin'.
 	if _, ok := memberOf[sqlbase.AdminRole]; ok {
-		return nil
+		return true, nil
 	}
 
-	return fmt.Errorf("only superusers are allowed to %s", action)
+	return false, nil
+}
+
+// RequireAdminRole implements the AuthorizationAccessor interface.
+// Requires a valid transaction to be open.
+func (p *planner) RequireAdminRole(ctx context.Context, action string) error {
+	ok, err := p.HasAdminRole(ctx)
+
+	if err != nil {
+		return err
+	}
+	if !ok {
+		//raise error if user is not a super-user
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"only users with the admin role are allowed to %s", action)
+	}
+	return nil
 }
 
 // MemberOfWithAdminOption looks up all the roles 'member' belongs to (direct and indirect) and
 // returns a map of "role" -> "isAdmin".
 // The "isAdmin" flag applies to both direct and indirect members.
+// Requires a valid transaction to be open.
 func (p *planner) MemberOfWithAdminOption(
 	ctx context.Context, member string,
 ) (map[string]bool, error) {
+	if p.txn == nil || !p.txn.IsOpen() {
+		return nil, errors.AssertionFailedf("cannot use MemberOfWithAdminoption without a txn")
+	}
+
+	roleMembersCache := p.execCfg.RoleMemberCache
+
 	// Lookup table version.
-	tableDesc, _, err := p.PhysicalSchemaAccessor().GetObjectDesc(&roleMembersTableName,
-		p.ObjectLookupFlags(ctx, true /*required*/))
+	objDesc, err := p.PhysicalSchemaAccessor().GetObjectDesc(
+		ctx,
+		p.txn,
+		p.ExecCfg().Settings,
+		p.ExecCfg().Codec,
+		roleMembersTableName.Catalog(),
+		roleMembersTableName.Schema(),
+		roleMembersTableName.Table(),
+		p.ObjectLookupFlags(true /*required*/, false /*requireMutable*/),
+	)
 	if err != nil {
 		return nil, err
 	}
+	tableDesc := objDesc.TableDesc()
 	tableVersion := tableDesc.Version
 
 	// We loop in case the table version changes while we're looking up memberships.
@@ -188,7 +248,7 @@ func (p *planner) MemberOfWithAdminOption(
 		roleMembersCache.Lock()
 		if roleMembersCache.tableVersion != tableVersion {
 			// Update version and drop the map.
-			roleMembersCache.tableVersion = tableDesc.Version
+			roleMembersCache.tableVersion = tableVersion
 			roleMembersCache.userCache = make(map[string]userRoleMembership)
 		}
 
@@ -218,7 +278,6 @@ func (p *planner) MemberOfWithAdminOption(
 		// Table version remains the same: update map, unlock, return.
 		roleMembersCache.userCache[member] = memberships
 		roleMembersCache.Unlock()
-
 		return memberships, nil
 	}
 }
@@ -246,7 +305,7 @@ func (p *planner) resolveMemberOfWithAdminOption(
 		}
 		visited[m] = struct{}{}
 
-		rows, _ /* cols */, err := p.ExecCfg().InternalExecutor.Query(
+		rows, err := p.ExecCfg().InternalExecutor.Query(
 			ctx, "expand-roles", nil /* txn */, lookupRolesStmt, m,
 		)
 		if err != nil {
@@ -266,3 +325,84 @@ func (p *planner) resolveMemberOfWithAdminOption(
 
 	return ret, nil
 }
+
+// HasRoleOption converts the roleoption to it's SQL column name and
+// checks if the user belongs to a role where the roleprivilege has value true.
+// Only works on checking the "positive version" of the privilege.
+// Requires a valid transaction to be open.
+// Example: CREATEROLE instead of NOCREATEROLE.
+func (p *planner) HasRoleOption(ctx context.Context, roleOption roleoption.Option) error {
+	// Verify that the txn is valid in any case, so that
+	// we don't get the risk to say "OK" to root requests
+	// with an invalid API usage.
+	if p.txn == nil || !p.txn.IsOpen() {
+		return errors.AssertionFailedf("cannot use HasRoleOption without a txn")
+	}
+
+	user := p.SessionData().User
+	if user == security.RootUser || user == security.NodeUser {
+		return nil
+	}
+
+	normalizedName, err := NormalizeAndValidateUsername(user)
+	if err != nil {
+		return err
+	}
+
+	// Create list of roles for sql WHERE IN clause.
+	memberOf, err := p.MemberOfWithAdminOption(ctx, normalizedName)
+	if err != nil {
+		return err
+	}
+
+	var roles = tree.NewDArray(types.String)
+	err = roles.Append(tree.NewDString(normalizedName))
+	if err != nil {
+		return err
+	}
+	for role := range memberOf {
+		err := roles.Append(tree.NewDString(role))
+		if err != nil {
+			return err
+		}
+	}
+
+	hasRolePrivilege, err := p.ExecCfg().InternalExecutor.QueryEx(
+		ctx, "has-role-option", p.Txn(),
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+		fmt.Sprintf(
+			`SELECT 1 from %s WHERE option = '%s' AND username = ANY($1) LIMIT 1`,
+			RoleOptionsTableName,
+			roleOption.String()),
+		roles)
+
+	if err != nil {
+		return err
+	}
+
+	if len(hasRolePrivilege) != 0 {
+		return nil
+	}
+
+	// User is not a member of a role that has CREATEROLE privilege.
+	return pgerror.Newf(pgcode.InsufficientPrivilege,
+		"user %s does not have %s privilege", user, roleOption.String())
+}
+
+// ConnAuditingClusterSettingName is the name of the cluster setting
+// for the cluster setting that enables pgwire-level connection audit
+// logs.
+//
+// This name is defined here because it is needed in the telemetry
+// counts in SetClusterSetting() and importing pgwire here would
+// create a circular dependency.
+const ConnAuditingClusterSettingName = "server.auth_log.sql_connections.enabled"
+
+// AuthAuditingClusterSettingName is the name of the cluster setting
+// for the cluster setting that enables pgwire-level authentication audit
+// logs.
+//
+// This name is defined here because it is needed in the telemetry
+// counts in SetClusterSetting() and importing pgwire here would
+// create a circular dependency.
+const AuthAuditingClusterSettingName = "server.auth_log.sql_sessions.enabled"

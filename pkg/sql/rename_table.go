@@ -1,30 +1,35 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
+
+type renameTableNode struct {
+	n            *tree.RenameTable
+	oldTn, newTn *tree.TableName
+	tableDesc    *sqlbase.MutableTableDescriptor
+}
 
 // RenameTable renames the table, view or sequence.
 // Privileges: DROP on source table/view/sequence, CREATE on destination database.
@@ -32,28 +37,16 @@ import (
 //          mysql requires ALTER, DROP on the original table, and CREATE, INSERT
 //          on the new table (and does not copy privileges over).
 func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNode, error) {
-	oldTn, err := n.Name.Normalize()
-	if err != nil {
-		return nil, err
-	}
-	newTn, err := n.NewName.Normalize()
-	if err != nil {
-		return nil, err
-	}
-
-	toRequire := requireTableOrViewDesc
+	oldTn := n.Name.ToTableName()
+	newTn := n.NewName.ToTableName()
+	toRequire := resolver.ResolveRequireTableOrViewDesc
 	if n.IsView {
-		toRequire = requireViewDesc
+		toRequire = resolver.ResolveRequireViewDesc
 	} else if n.IsSequence {
-		toRequire = requireSequenceDesc
+		toRequire = resolver.ResolveRequireSequenceDesc
 	}
 
-	var tableDesc *TableDescriptor
-	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
-	// TODO(vivek): check if the cache can be used.
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		tableDesc, err = ResolveExistingObject(ctx, p, oldTn, !n.IfExists, toRequire)
-	})
+	tableDesc, err := p.ResolveMutableTableDescriptor(ctx, &oldTn, !n.IfExists, toRequire)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +56,7 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 	}
 
 	if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
-		return nil, sqlbase.NewUndefinedRelationError(oldTn)
+		return nil, sqlbase.NewUndefinedRelationError(&oldTn)
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.DROP); err != nil {
@@ -79,26 +72,51 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 			ctx, tableDesc.TypeName(), oldTn.String(), tableDesc.ParentID, tableDesc.DependedOnBy[0].ID)
 	}
 
-	var prevDbDesc *DatabaseDescriptor
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		prevDbDesc, err = ResolveDatabase(ctx, p, oldTn.Catalog(), true /*required*/)
-	})
+	return &renameTableNode{n: n, oldTn: &oldTn, newTn: &newTn, tableDesc: tableDesc}, nil
+}
+
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because RENAME DATABASE performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *renameTableNode) ReadingOwnWrites() {}
+
+func (n *renameTableNode) startExec(params runParams) error {
+	p := params.p
+	ctx := params.ctx
+	oldTn := n.oldTn
+	newTn := n.newTn
+	tableDesc := n.tableDesc
+
+	oldUn := oldTn.ToUnresolvedObjectName()
+	prevDbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, oldUn)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	oldTn.ObjectNamePrefix = prefix
 
 	// Check if target database exists.
 	// We also look at uncached descriptors here.
-	var targetDbDesc *DatabaseDescriptor
-	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		targetDbDesc, err = ResolveTargetObject(ctx, p, newTn)
-	})
+	newUn := newTn.ToUnresolvedObjectName()
+	targetDbDesc, prefix, err := p.ResolveUncachedDatabase(ctx, newUn)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	newTn.ObjectNamePrefix = prefix
 
 	if err := p.CheckPrivilege(ctx, targetDbDesc, privilege.CREATE); err != nil {
-		return nil, err
+		return err
+	}
+
+	isNewSchemaTemp, _, err := temporarySchemaSessionID(newTn.Schema())
+	if err != nil {
+		return err
+	}
+
+	if newTn.ExplicitSchema && !isNewSchemaTemp && tableDesc.Temporary {
+		return pgerror.New(
+			pgcode.FeatureNotSupported,
+			"cannot convert a temporary table to a persistent table during renames",
+		)
 	}
 
 	// oldTn and newTn are already normalized, so we can compare directly here.
@@ -106,57 +124,74 @@ func (p *planner) RenameTable(ctx context.Context, n *tree.RenameTable) (planNod
 		oldTn.Schema() == newTn.Schema() &&
 		oldTn.Table() == newTn.Table() {
 		// Noop.
-		return newZeroNode(nil /* columns */), nil
+		return nil
 	}
 
 	tableDesc.SetName(newTn.Table())
-	tableDesc.ParentID = targetDbDesc.ID
+	tableDesc.ParentID = targetDbDesc.GetID()
 
-	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
-	newTbKey := tableKey{targetDbDesc.ID, newTn.Table()}.Key()
+	newTbKey := sqlbase.MakeObjectNameKey(ctx, params.ExecCfg().Settings,
+		targetDbDesc.GetID(), tableDesc.GetParentSchemaID(), newTn.Table()).Key(p.ExecCfg().Codec)
 
-	if err := tableDesc.Validate(ctx, p.txn, p.EvalContext().Settings); err != nil {
-		return nil, err
+	if err := tableDesc.Validate(ctx, p.txn, p.ExecCfg().Codec); err != nil {
+		return err
 	}
 
 	descID := tableDesc.GetID()
-	descDesc := sqlbase.WrapDescriptor(tableDesc)
+	parentSchemaID := tableDesc.GetParentSchemaID()
 
-	renameDetails := sqlbase.TableDescriptor_NameInfo{
-		ParentID: prevDbDesc.ID,
-		Name:     oldTn.Table()}
+	renameDetails := sqlbase.NameInfo{
+		ParentID:       prevDbDesc.GetID(),
+		ParentSchemaID: parentSchemaID,
+		Name:           oldTn.Table()}
 	tableDesc.DrainingNames = append(tableDesc.DrainingNames, renameDetails)
-	if err := p.writeSchemaChange(ctx, tableDesc, sqlbase.InvalidMutationID); err != nil {
-		return nil, err
+	if err := p.writeSchemaChange(
+		ctx, tableDesc, sqlbase.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
 	}
 
 	// We update the descriptor to the new name, but also leave the mapping of the
 	// old name to the id, so that the name is not reused until the schema changer
 	// has made sure it's not in use any more.
-	b := &client.Batch{}
+	b := &kv.Batch{}
 	if p.extendedEvalCtx.Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
 		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
 	}
-	b.Put(descKey, descDesc)
-	b.CPut(newTbKey, descID, nil)
-
-	if err := p.txn.Run(ctx, b); err != nil {
-		if _, ok := err.(*roachpb.ConditionFailedError); ok {
-			return nil, sqlbase.NewRelationAlreadyExistsError(newTn.Table())
-		}
-		return nil, err
+	err = catalogkv.WriteDescToBatch(ctx, p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+		p.EvalContext().Settings, b, p.ExecCfg().Codec, descID, tableDesc)
+	if err != nil {
+		return err
 	}
 
-	return newZeroNode(nil /* columns */), nil
+	exists, id, err := sqlbase.LookupPublicTableID(
+		params.ctx, params.p.txn, p.ExecCfg().Codec, targetDbDesc.GetID(), newTn.Table(),
+	)
+	if err == nil && exists {
+		// Try and see what kind of object we collided with.
+		desc, err := catalogkv.GetDescriptorByID(params.ctx, params.p.txn, p.ExecCfg().Codec, id)
+		if err != nil {
+			return err
+		}
+		return sqlbase.MakeObjectAlreadyExistsError(desc.DescriptorProto(), newTn.Table())
+	} else if err != nil {
+		return err
+	}
+
+	b.CPut(newTbKey, descID, nil)
+	return p.txn.Run(ctx, b)
 }
+
+func (n *renameTableNode) Next(runParams) (bool, error) { return false, nil }
+func (n *renameTableNode) Values() tree.Datums          { return tree.Datums{} }
+func (n *renameTableNode) Close(context.Context)        {}
 
 // TODO(a-robinson): Support renaming objects depended on by views once we have
 // a better encoding for view queries (#10083).
 func (p *planner) dependentViewRenameError(
 	ctx context.Context, typeName, objName string, parentID, viewID sqlbase.ID,
 ) error {
-	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, viewID)
+	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, p.ExecCfg().Codec, viewID)
 	if err != nil {
 		return err
 	}
@@ -166,13 +201,13 @@ func (p *planner) dependentViewRenameError(
 		viewName, err = p.getQualifiedTableName(ctx, viewDesc)
 		if err != nil {
 			log.Warningf(ctx, "unable to retrieve name of view %d: %v", viewID, err)
-			msg := fmt.Sprintf("cannot rename %s %q because a view depends on it",
+			return sqlbase.NewDependentObjectErrorf(
+				"cannot rename %s %q because a view depends on it",
 				typeName, objName)
-			return sqlbase.NewDependentObjectError(msg)
 		}
 	}
-	msg := fmt.Sprintf("cannot rename %s %q because view %q depends on it",
-		typeName, objName, viewName)
-	hint := fmt.Sprintf("you can drop %s instead.", viewName)
-	return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+	return errors.WithHintf(
+		sqlbase.NewDependentObjectErrorf("cannot rename %s %q because view %q depends on it",
+			typeName, objName, viewName),
+		"you can drop %s instead.", viewName)
 }

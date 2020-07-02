@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cli
 
@@ -18,7 +14,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -29,31 +24,66 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	readline "github.com/knz/go-libedit"
-	"github.com/lib/pq"
 	isatty "github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
 const (
-	infoMessage = `# Welcome to the cockroach SQL interface.
+	welcomeMessage = `#
+# Welcome to the CockroachDB SQL shell.
 # All statements must be terminated by a semicolon.
-# To exit: CTRL + D.
+# To exit, type: \q.
 #
 `
-)
+	helpMessageFmt = `You are using 'cockroach sql', CockroachDB's lightweight SQL client.
+Type:
+  \? or "help"      print this help.
+  \q, quit, exit    exit the shell (Ctrl+C/Ctrl+D also supported).
+  \! CMD            run an external command and print its results on standard output.
+  \| CMD            run an external command and run its output as SQL statements.
+  \set [NAME]       set a client-side flag or (without argument) print the current settings.
+  \unset NAME       unset a flag.
+  \show             during a multi-line statement or transaction, show the SQL entered so far.
+  \h [NAME]         help on syntax of SQL commands.
+  \hf [NAME]        help on SQL built-in functions.
+  \l                list all databases in the CockroachDB cluster.
+  \dt               show the tables of the current schema in the current database.
+  \du               list the users for all databases.
+  \d [TABLE]        show details about columns in the specified table, or alias for '\dt' if no table is specified.
+%s
+More documentation about our SQL dialect and the CLI shell is available online:
+%s
+%s`
 
-const defaultPromptPattern = "%n@%M/%/%x>"
+	demoCommandsHelp = `
+Commands specific to the demo shell (EXPERIMENTAL):
+  \demo ls                     list the demo nodes and their connection URLs.
+  \demo shutdown <nodeid>      stop a demo node.
+  \demo restart <nodeid>       restart a stopped demo node.
+  \demo decommission <nodeid>  decommission a node.
+  \demo recommission <nodeid>  recommission a node.
+`
+
+	defaultPromptPattern = "%n@%M/%/%x>"
+
+	// debugPromptPattern avoids substitution patterns that require a db roundtrip.
+	debugPromptPattern = "%n@%M>"
+)
 
 // sqlShellCmd opens a sql shell.
 var sqlShellCmd = &cobra.Command{
@@ -184,22 +214,13 @@ const (
 )
 
 // printCliHelp prints a short inline help about the CLI.
-func printCliHelp() {
-	fmt.Printf(`You are using 'cockroach sql', CockroachDB's lightweight SQL client.
-Type:
-  \q to exit        (Ctrl+C/Ctrl+D also supported)
-  \! CMD            run an external command and print its results on standard output.
-  \| CMD            run an external command and run its output as SQL statements.
-  \set [NAME]       set a client-side flag or (without argument) print the current settings.
-  \unset NAME       unset a flag.
-  \show             during a multi-line statement or transaction, show the SQL entered so far.
-  \? or "help"      print this help.
-  \h [NAME]         help on syntax of SQL commands.
-  \hf [NAME]        help on SQL built-in functions.
-
-More documentation about our SQL dialect and the CLI shell is available online:
-%s
-%s`,
+func (c *cliState) printCliHelp() {
+	demoHelpStr := ""
+	if demoCtx.transientCluster != nil {
+		demoHelpStr = demoCommandsHelp
+	}
+	fmt.Printf(helpMessageFmt,
+		demoHelpStr,
 		base.DocsURL("sql-statements.html"),
 		base.DocsURL("use-the-built-in-sql-client.html"),
 	)
@@ -212,8 +233,7 @@ func (c *cliState) hasEditor() bool {
 	return c.ins != noLineEditor
 }
 
-// addHistory persists a line of input to the readline history
-// file.
+// addHistory persists a line of input to the readline history file.
 func (c *cliState) addHistory(line string) {
 	if !c.hasEditor() || len(line) == 0 {
 		return
@@ -248,6 +268,12 @@ func (c *cliState) invalidOptionChange(nextState cliStateEnum, opt string) cliSt
 	return nextState
 }
 
+func (c *cliState) internalServerError(nextState cliStateEnum, err error) cliStateEnum {
+	fmt.Fprintf(stderr, "internal server error: %v\n", err)
+	c.exitErr = err
+	return nextState
+}
+
 var options = map[string]struct {
 	description               string
 	isBoolean                 bool
@@ -255,13 +281,14 @@ var options = map[string]struct {
 	set                       func(c *cliState, val string) error
 	reset                     func(c *cliState) error
 	// display is used to retrieve the current value.
-	display func(c *cliState) string
+	display    func(c *cliState) string
+	deprecated bool
 }{
 	`auto_trace`: {
-		"automatically run statement tracing on each executed statement",
-		false,
-		false,
-		func(c *cliState, val string) error {
+		description:               "automatically run statement tracing on each executed statement",
+		isBoolean:                 false,
+		validDuringMultilineEntry: false,
+		set: func(c *cliState, val string) error {
 			val = strings.ToLower(strings.TrimSpace(val))
 			switch val {
 			case "false", "0", "off":
@@ -274,11 +301,11 @@ var options = map[string]struct {
 			}
 			return nil
 		},
-		func(c *cliState) error {
+		reset: func(c *cliState) error {
 			c.autoTrace = ""
 			return nil
 		},
-		func(c *cliState) string {
+		display: func(c *cliState) string {
 			if c.autoTrace == "" {
 				return "off"
 			}
@@ -286,67 +313,76 @@ var options = map[string]struct {
 		},
 	},
 	`display_format`: {
-		"the output format for tabular data (pretty, csv, tsv, html, sql, records, raw)",
-		false,
-		true,
-		func(_ *cliState, val string) error {
+		description:               "the output format for tabular data (table, csv, tsv, html, sql, records, raw)",
+		isBoolean:                 false,
+		validDuringMultilineEntry: true,
+		set: func(_ *cliState, val string) error {
 			return cliCtx.tableDisplayFormat.Set(val)
 		},
-		func(_ *cliState) error {
+		reset: func(_ *cliState) error {
 			displayFormat := tableDisplayTSV
 			if cliCtx.terminalOutput {
-				displayFormat = tableDisplayPretty
+				displayFormat = tableDisplayTable
 			}
 			cliCtx.tableDisplayFormat = displayFormat
 			return nil
 		},
-		func(_ *cliState) string { return cliCtx.tableDisplayFormat.String() },
+		display: func(_ *cliState) string { return cliCtx.tableDisplayFormat.String() },
 	},
 	`echo`: {
-		"show SQL queries before they are sent to the server",
-		true,
-		false,
-		func(_ *cliState, _ string) error { sqlCtx.echo = true; return nil },
-		func(_ *cliState) error { sqlCtx.echo = false; return nil },
-		func(_ *cliState) string { return strconv.FormatBool(sqlCtx.echo) },
+		description:               "show SQL queries before they are sent to the server",
+		isBoolean:                 true,
+		validDuringMultilineEntry: false,
+		set:                       func(_ *cliState, _ string) error { sqlCtx.echo = true; return nil },
+		reset:                     func(_ *cliState) error { sqlCtx.echo = false; return nil },
+		display:                   func(_ *cliState) string { return strconv.FormatBool(sqlCtx.echo) },
 	},
 	`errexit`: {
-		"exit the shell upon a query error",
-		true,
-		true,
-		func(c *cliState, _ string) error { c.errExit = true; return nil },
-		func(c *cliState) error { c.errExit = false; return nil },
-		func(c *cliState) string { return strconv.FormatBool(c.errExit) },
+		description:               "exit the shell upon a query error",
+		isBoolean:                 true,
+		validDuringMultilineEntry: true,
+		set:                       func(c *cliState, _ string) error { c.errExit = true; return nil },
+		reset:                     func(c *cliState) error { c.errExit = false; return nil },
+		display:                   func(c *cliState) string { return strconv.FormatBool(c.errExit) },
 	},
 	`check_syntax`: {
-		"check the SQL syntax before running a query (needs SHOW SYNTAX support on the server)",
-		true,
-		false,
-		func(c *cliState, _ string) error { c.checkSyntax = true; return nil },
-		func(c *cliState) error { c.checkSyntax = false; return nil },
-		func(c *cliState) string { return strconv.FormatBool(c.checkSyntax) },
+		description:               "check the SQL syntax before running a query (needs SHOW SYNTAX support on the server)",
+		isBoolean:                 true,
+		validDuringMultilineEntry: false,
+		set:                       func(c *cliState, _ string) error { c.checkSyntax = true; return nil },
+		reset:                     func(c *cliState) error { c.checkSyntax = false; return nil },
+		display:                   func(c *cliState) string { return strconv.FormatBool(c.checkSyntax) },
 	},
 	`show_times`: {
-		"display the execution time after each query",
-		true,
-		true,
-		func(_ *cliState, _ string) error { cliCtx.showTimes = true; return nil },
-		func(_ *cliState) error { cliCtx.showTimes = false; return nil },
-		func(_ *cliState) string { return strconv.FormatBool(cliCtx.showTimes) },
+		description:               "display the execution time after each query",
+		isBoolean:                 true,
+		validDuringMultilineEntry: true,
+		set:                       func(_ *cliState, _ string) error { sqlCtx.showTimes = true; return nil },
+		reset:                     func(_ *cliState) error { sqlCtx.showTimes = false; return nil },
+		display:                   func(_ *cliState) string { return strconv.FormatBool(sqlCtx.showTimes) },
+	},
+	`smart_prompt`: {
+		description:               "deprecated",
+		isBoolean:                 true,
+		validDuringMultilineEntry: false,
+		set:                       func(c *cliState, _ string) error { return nil },
+		reset:                     func(c *cliState) error { return nil },
+		display:                   func(c *cliState) string { return "false" },
+		deprecated:                true,
 	},
 	`prompt1`: {
-		"prompt string to use before each command (the following are expanded: %M full host, %m host, %> port number, %n user, %/ database, %x txn status)",
-		false,
-		true,
-		func(c *cliState, val string) error {
+		description:               "prompt string to use before each command (the following are expanded: %M full host, %m host, %> port number, %n user, %/ database, %x txn status)",
+		isBoolean:                 false,
+		validDuringMultilineEntry: true,
+		set: func(c *cliState, val string) error {
 			c.customPromptPattern = val
 			return nil
 		},
-		func(c *cliState) error {
+		reset: func(c *cliState) error {
 			c.customPromptPattern = defaultPromptPattern
 			return nil
 		},
-		func(c *cliState) string { return c.customPromptPattern },
+		display: func(c *cliState) string { return c.customPromptPattern },
 	},
 }
 
@@ -366,6 +402,9 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 	if len(args) == 0 {
 		optData := make([][]string, 0, len(options))
 		for _, n := range optionNames {
+			if options[n].deprecated {
+				continue
+			}
 			optData = append(optData, []string{n, options[n].display(c), options[n].description})
 		}
 		err := printQueryOutput(os.Stdout,
@@ -444,19 +483,63 @@ func (c *cliState) handleUnset(args []string, nextState, errState cliStateEnum) 
 	return nextState
 }
 
-func checkTokens(fullStmt string) (isEmpty bool, lastTok int) {
-	sc := parser.MakeScanner(fullStmt)
-	isEmpty = true
-	var last int
-	sc.Tokens(func(t int) {
-		isEmpty = false
-		last = t
-	})
-	return isEmpty, last
-}
-
 func isEndOfStatement(lastTok int) bool {
 	return lastTok == ';' || lastTok == parser.HELPTOKEN
+}
+
+// handleDemo handles operations on \demo.
+// This can only be done from `cockroach demo`.
+func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cliStateEnum {
+	// A transient cluster signifies the presence of `cockroach demo`.
+	if demoCtx.transientCluster == nil {
+		return c.invalidSyntax(errState, `\demo can only be run with cockroach demo`)
+	}
+
+	if len(cmd) == 1 && cmd[0] == "ls" {
+		demoCtx.transientCluster.listDemoNodes(os.Stdout, false /* justOne */)
+		return nextState
+	}
+
+	if len(cmd) != 2 {
+		return c.invalidSyntax(errState, `\demo expects 2 parameters`)
+	}
+
+	nodeID, err := strconv.ParseInt(cmd[1], 10, 32)
+	if err != nil {
+		return c.invalidSyntax(
+			errState,
+			"%s",
+			errors.Wrapf(err, "cannot convert %s to string", cmd[2]).Error(),
+		)
+	}
+
+	switch cmd[0] {
+	case "shutdown":
+		if err := demoCtx.transientCluster.DrainAndShutdown(roachpb.NodeID(nodeID)); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been shutdown\n", nodeID)
+		return nextState
+	case "restart":
+		if err := demoCtx.transientCluster.RestartNode(roachpb.NodeID(nodeID)); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been restarted\n", nodeID)
+		return nextState
+	case "recommission":
+		if err := demoCtx.transientCluster.CallDecommission(roachpb.NodeID(nodeID), false /* decommissioning */); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been recommissioned\n", nodeID)
+		return nextState
+	case "decommission":
+		if err := demoCtx.transientCluster.CallDecommission(roachpb.NodeID(nodeID), true /* decommissioning */); err != nil {
+			return c.internalServerError(errState, err)
+		}
+		fmt.Printf("node %d has been decommissioned\n", nodeID)
+		return nextState
+	}
+	return c.invalidSyntax(errState, `command not recognized: %s`, cmd[0])
 }
 
 // handleHelp prints SQL help.
@@ -488,14 +571,14 @@ func (c *cliState) handleFunctionHelp(cmd []string, nextState, errState cliState
 		}
 		fmt.Println()
 	} else {
-		_, err := parser.Parse(fmt.Sprintf("select %s(??", funcName))
-		pgerr, ok := pgerror.GetPGCause(err)
-		if !ok || !strings.HasPrefix(pgerr.Hint, "help:") {
+		helpText, _ := c.serverSideParse(fmt.Sprintf("select %s(??", funcName))
+		if helpText != "" {
+			fmt.Println(helpText)
+		} else {
 			fmt.Fprintf(stderr,
 				"no help available for %q.\nTry \\hf with no argument to see available help.\n", funcName)
 			return errState
 		}
-		fmt.Println(pgerr.Hint[6:])
 	}
 	return nextState
 }
@@ -560,8 +643,22 @@ func (c *cliState) pipeSyscmd(line string, nextState, errState cliStateEnum) cli
 	return nextState
 }
 
-// rePromptFmt: available keys compile with regex expression one time.
+// rePromptFmt recognizes every substitution pattern in the prompt format string.
 var rePromptFmt = regexp.MustCompile("(%.)")
+
+// rePromptDbState recognizes every substitution pattern that requires
+// access to the current database state.
+// Currently:
+// %/ database name
+// %x txn status
+var rePromptDbState = regexp.MustCompile("(?:^|[^%])%[/x]")
+
+// unknownDbName is the string to use in the prompt when
+// the database cannot be determined.
+const unknownDbName = "?"
+
+// unknownTxnStatus is the string to use in the prompt when the txn status cannot be determined.
+const unknownTxnStatus = " ?"
 
 // doRefreshPrompts refreshes the prompts of the client depending on the
 // status of the current transaction.
@@ -579,17 +676,22 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 		return nextState
 	}
 
-	// Prepare variables for use during the substitution below.
-	c.refreshTransactionStatus()
-	// refreshDatabaseName() must be called *after* refreshTransactionStatus(),
-	// even when %/ appears before %x in the prompt format.
-	dbName, hasDbName := c.refreshDatabaseName()
-	if !hasDbName {
-		dbName = "?"
-	}
 	userName := ""
 	if parsedURL.User != nil {
 		userName = parsedURL.User.Username()
+	}
+
+	dbName := unknownDbName
+	c.lastKnownTxnStatus = unknownTxnStatus
+
+	wantDbStateInPrompt := rePromptDbState.MatchString(c.customPromptPattern)
+	if wantDbStateInPrompt {
+		c.refreshTransactionStatus()
+		// refreshDatabaseName() must be called *after* refreshTransactionStatus(),
+		// even when %/ appears before %x in the prompt format.
+		// This is because the database name should not be queried during
+		// some transaction phases.
+		dbName = c.refreshDatabaseName()
 	}
 
 	c.fullPrompt = rePromptFmt.ReplaceAllStringFunc(c.customPromptPattern, func(m string) string {
@@ -605,7 +707,6 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 		case "%/": // database name.
 			return dbName
 		case "%x": // txn status.
-			c.refreshTransactionStatus()
 			return c.lastKnownTxnStatus
 		case "%%":
 			return "%"
@@ -643,7 +744,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 
 // refreshTransactionStatus retrieves and sets the current transaction status.
 func (c *cliState) refreshTransactionStatus() {
-	c.lastKnownTxnStatus = " ?"
+	c.lastKnownTxnStatus = unknownTxnStatus
 
 	dbVal, hasVal := c.conn.getServerValue("transaction status", `SHOW TRANSACTION STATUS`)
 	if !hasVal {
@@ -655,14 +756,12 @@ func (c *cliState) refreshTransactionStatus() {
 
 	// Change the prompt based on the response from the server.
 	switch txnString {
-	case sql.NoTxnStr:
+	case sql.NoTxnStateStr:
 		c.lastKnownTxnStatus = ""
 	case sql.AbortedStateStr:
 		c.lastKnownTxnStatus = " ERROR"
 	case sql.CommitWaitStateStr:
 		c.lastKnownTxnStatus = "  DONE"
-	case sql.RestartWaitStateStr:
-		c.lastKnownTxnStatus = " RETRY"
 	case sql.OpenStateStr:
 		// The state AutoRetry is reported by the server as Open, so no need to
 		// handle it here.
@@ -673,16 +772,16 @@ func (c *cliState) refreshTransactionStatus() {
 // refreshDatabaseName retrieves the current database name from the server.
 // The database name is only queried if there is no transaction ongoing,
 // or the transaction is fully open.
-func (c *cliState) refreshDatabaseName() (string, bool) {
+func (c *cliState) refreshDatabaseName() string {
 	if !(c.lastKnownTxnStatus == "" /*NoTxn*/ ||
 		c.lastKnownTxnStatus == "  OPEN" ||
-		c.lastKnownTxnStatus == " ?" /* Unknown */) {
-		return "", false
+		c.lastKnownTxnStatus == unknownTxnStatus) {
+		return unknownDbName
 	}
 
 	dbVal, hasVal := c.conn.getServerValue("database name", `SHOW DATABASE`)
 	if !hasVal {
-		return "", false
+		return unknownDbName
 	}
 
 	if dbVal == "" {
@@ -697,23 +796,7 @@ func (c *cliState) refreshDatabaseName() (string, bool) {
 	// Preserve the current database name in case of reconnects.
 	c.conn.dbName = dbName
 
-	return dbName, true
-}
-
-// endsWithIncompleteTxn returns true if and only if its
-// argument ends with an incomplete transaction prefix (BEGIN without
-// ROLLBACK/COMMIT).
-func endsWithIncompleteTxn(stmts []string) bool {
-	txnStarted := false
-	for _, stmt := range stmts {
-		if strings.HasPrefix(stmt, "BEGIN TRANSACTION") {
-			txnStarted = true
-		} else if strings.HasPrefix(stmt, "COMMIT TRANSACTION") ||
-			strings.HasPrefix(stmt, "ROLLBACK TRANSACTION") {
-			txnStarted = false
-		}
-	}
-	return txnStarted
+	return dbName
 }
 
 var cmdHistFile = envutil.EnvOrDefaultString("COCKROACH_SQL_CLI_HISTORY", ".cockroachsql_history")
@@ -724,20 +807,21 @@ func (c *cliState) GetCompletions(_ string) []string {
 
 	if !strings.HasSuffix(sql, "??") {
 		fmt.Fprintf(c.ins.Stdout(),
-			"\ntab completion not supported; append '??' and press tab for contextual help\n\n%s", sql)
-		return nil
+			"\ntab completion not supported; append '??' and press tab for contextual help\n\n")
+	} else {
+		helpText, err := c.serverSideParse(sql)
+		if helpText != "" {
+			// We have a completion suggestion. Use that.
+			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", helpText)
+		} else if err != nil {
+			// Some other error. Display it.
+			fmt.Fprintln(c.ins.Stdout())
+			cliOutputError(c.ins.Stdout(), err, true /*showSeverity*/, false /*verbose*/)
+		}
 	}
 
-	_, pgErr := c.serverSideParse(sql)
-	if pgErr != nil {
-		if pgErr.Message == "help token in input" && strings.HasPrefix(pgErr.Hint, "help:") {
-			fmt.Fprintf(c.ins.Stdout(), "\nSuggestion:\n%s\n", pgErr.Hint[6:])
-		} else {
-			fmt.Fprintf(c.ins.Stdout(), "\n%v\n", pgErr)
-			maybeShowErrorDetails(c.ins.Stdout(), pgErr, false)
-		}
-		fmt.Fprint(c.ins.Stdout(), c.currentPrompt, sql)
-	}
+	// After the suggestion or error, re-display the prompt and current entry.
+	fmt.Fprint(c.ins.Stdout(), c.currentPrompt, sql)
 	return nil
 }
 
@@ -746,50 +830,7 @@ func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
 	c.partialLines = []string{}
 
 	if cliCtx.isInteractive {
-		// If a human user is providing the input, we want to help them with
-		// what they are entering:
-		c.errExit = false // let the user retry failing commands
-		// Also, try to enable syntax checking if supported by the server.
-		// This is a form of client-side error checking to help with large txns.
-		c.tryEnableCheckSyntax()
-
 		fmt.Println("#\n# Enter \\? for a brief introduction.\n#")
-	} else {
-		// When running non-interactive, by default we want errors to stop
-		// further processing and we can just let syntax checking to be
-		// done server-side to avoid client-side churn.
-		c.errExit = true
-		c.checkSyntax = false
-		// We also don't need (smart) prompts at all.
-	}
-
-	if c.hasEditor() {
-		// We only enable prompt and history management when the
-		// interactive input prompter is enabled. This saves on churn and
-		// memory when e.g. piping a large SQL script through the
-		// command-line client.
-
-		// Default prompt is part of the connection URL. eg: "marc@localhost:26257>".
-		c.customPromptPattern = defaultPromptPattern
-
-		c.ins.SetCompleter(c)
-		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
-			log.Warningf(context.TODO(), "cannot enable history: %v", err)
-		} else {
-			homeDir, err := envutil.HomeDir()
-			if err != nil {
-				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
-				log.Warning(context.TODO(), "history will not be saved")
-			} else {
-				histFile := filepath.Join(homeDir, cmdHistFile)
-				err = c.ins.LoadHistory(histFile)
-				if err != nil {
-					log.Warningf(context.TODO(), "cannot load the command-line history (file corrupted?): %v", err)
-					log.Warning(context.TODO(), "the history file will be cleared upon first entry")
-				}
-				c.ins.SetAutoSaveHistory(histFile, true)
-			}
-		}
 	}
 
 	return nextState
@@ -856,8 +897,8 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		}
 	}
 
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		// Do we have multiple lines of input?
 		lines := strings.Split(l, "\n")
 		if len(lines) > 1 {
@@ -868,7 +909,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		}
 		// In any case, process one line.
 
-	case readline.ErrInterrupted:
+	case errors.Is(err, readline.ErrInterrupted):
 		if !cliCtx.isInteractive {
 			// Ctrl+C terminates non-interactive shells in all cases.
 			c.exitErr = err
@@ -891,7 +932,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		c.exitErr = err
 		return cliStop
 
-	case io.EOF:
+	case errors.Is(err, io.EOF):
 		c.atEOF = true
 
 		if cliCtx.isInteractive {
@@ -927,9 +968,12 @@ func (c *cliState) doProcessFirstLine(startState, nextState cliStateEnum) cliSta
 		// Ignore empty lines, just continue reading if it isn't interactive mode.
 		return startState
 
-	case "help", "quit", "exit":
-		printCliHelp()
+	case "help":
+		c.printCliHelp()
 		return startState
+
+	case "exit", "quit":
+		return cliStop
 	}
 
 	return nextState
@@ -961,7 +1005,7 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		return cliStop
 
 	case `\`, `\?`, `\help`:
-		printCliHelp()
+		c.printCliHelp()
 
 	case `\set`:
 		return c.handleSet(cmd[1:], loopState, errState)
@@ -990,6 +1034,31 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	case `\hf`:
 		return c.handleFunctionHelp(cmd[1:], loopState, errState)
 
+	case `\l`:
+		c.concatLines = `SHOW DATABASES`
+		return cliRunStatement
+
+	case `\dt`:
+		c.concatLines = `SHOW TABLES`
+		return cliRunStatement
+
+	case `\du`:
+		c.concatLines = `SHOW USERS`
+		return cliRunStatement
+
+	case `\d`:
+		if len(cmd) == 1 {
+			c.concatLines = `SHOW TABLES`
+			return cliRunStatement
+		} else if len(cmd) == 2 {
+			c.concatLines = `SHOW COLUMNS FROM ` + cmd[1]
+			return cliRunStatement
+		}
+		return c.invalidSyntax(errState, `%s. Try \? for help.`, c.lastInputLine)
+
+	case `\demo`:
+		return c.handleDemo(cmd[1:], loopState, errState)
+
 	default:
 		if strings.HasPrefix(cmd[0], `\d`) {
 			// Unrecognized command for now, but we want to be helpful.
@@ -1015,9 +1084,9 @@ func (c *cliState) doPrepareStatementLine(
 		return startState
 	}
 
-	isEmpty, lastTok := checkTokens(c.concatLines)
+	lastTok, ok := parser.LastLexicalToken(c.concatLines)
 	endOfStmt := isEndOfStatement(lastTok)
-	if c.partialStmtsLen == 0 && isEmpty {
+	if c.partialStmtsLen == 0 && !ok {
 		// More whitespace, or comments. Still nothing to do. However
 		// if the syntax was non-trivial to arrive here,
 		// keep it for history.
@@ -1059,18 +1128,19 @@ func (c *cliState) doPrepareStatementLine(
 
 func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnum) cliStateEnum {
 	// From here on, client-side syntax checking is enabled.
-	parsedStmts, pgErr := c.serverSideParse(c.concatLines)
-	if pgErr != nil {
-		if pgErr.Message == "help token in input" && strings.HasPrefix(pgErr.Hint, "help:") {
-			fmt.Println(pgErr.Hint[6:])
-		} else {
-			_ = c.invalidSyntax(0, "statement ignored: %v", pgErr)
-			maybeShowErrorDetails(stderr, pgErr, false)
+	helpText, err := c.serverSideParse(c.concatLines)
+	if err != nil {
+		if helpText != "" {
+			// There was a help text included. Use it.
+			fmt.Println(helpText)
+		}
 
-			// Stop here if exiterr is set.
-			if c.errExit {
-				return cliStop
-			}
+		_ = c.invalidSyntax(0, "statement ignored: %v",
+			&formattedError{err: err, showSeverity: false, verbose: false})
+
+		// Stop here if exiterr is set.
+		if c.errExit {
+			return cliStop
 		}
 
 		// Remove the erroneous lines from the buffered input,
@@ -1088,19 +1158,6 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 
 	nextState := execState
 
-	// In interactive mode, we make some additional effort to help the user:
-	// if the entry so far is starting an incomplete transaction, push
-	// the user to enter input over multiple lines.
-	if c.lastKnownTxnStatus == "" && endsWithIncompleteTxn(parsedStmts) && c.lastInputLine != "" {
-		if c.partialStmtsLen == 0 {
-			fmt.Fprintln(stderr, "Now adding input for a multi-line SQL transaction client-side.\n"+
-				"Press Enter two times to send the SQL text collected so far to the server, or Ctrl+C to cancel.\n"+
-				"You can also use \\show to display the statements entered so far.")
-		}
-
-		nextState = contState
-	}
-
 	c.partialStmtsLen = len(c.partialLines)
 
 	return nextState
@@ -1117,8 +1174,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 		// with the specified options.
 		c.exitErr = c.conn.Exec("SET tracing = off; SET tracing = "+c.autoTrace, nil)
 		if c.exitErr != nil {
-			fmt.Fprintln(stderr, c.exitErr)
-			maybeShowErrorDetails(stderr, c.exitErr, false)
+			cliOutputError(stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
 			if c.errExit {
 				return cliStop
 			}
@@ -1129,8 +1185,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 	// Now run the statement/query.
 	c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(c.concatLines))
 	if c.exitErr != nil {
-		fmt.Fprintln(stderr, c.exitErr)
-		maybeShowErrorDetails(stderr, c.exitErr, false)
+		cliOutputError(stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
 	}
 
 	// If we are tracing, stop tracing and display the trace. We do
@@ -1140,8 +1195,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 		if err := c.conn.Exec("SET tracing = off", nil); err != nil {
 			// Print the error for the SET tracing statement. This will
 			// appear below the error for the main query above, if any,
-			fmt.Fprintln(stderr, err)
-			maybeShowErrorDetails(stderr, err, false)
+			cliOutputError(stderr, err, true /*showSeverity*/, false /*verbose*/)
 			if c.exitErr == nil {
 				// The query had encountered no error above, but now we are
 				// encountering an error on SET tracing. Consider this to
@@ -1158,8 +1212,7 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 			}
 			if err := runQueryAndFormatResults(c.conn, os.Stdout,
 				makeQuery(fmt.Sprintf("SHOW %s TRACE FOR SESSION", traceType))); err != nil {
-				fmt.Fprintln(stderr, err)
-				maybeShowErrorDetails(stderr, err, false)
+				cliOutputError(stderr, err, true /*showSeverity*/, false /*verbose*/)
 				if c.exitErr == nil {
 					// Both the query and SET tracing had encountered no error
 					// above, but now we are encountering an error on SHOW TRACE
@@ -1178,31 +1231,6 @@ func (c *cliState) doRunStatement(nextState cliStateEnum) cliStateEnum {
 	}
 
 	return nextState
-}
-
-// maybeShowErrorDetails displays the pg "Detail" and "Hint" fields
-// embedded in the error, if any, to the user. If printNewline is set,
-// a newline character is printed before anything else.
-func maybeShowErrorDetails(w io.Writer, err error, printNewline bool) {
-	var hint, detail string
-	if pqErr, ok := err.(*pq.Error); ok {
-		hint, detail = pqErr.Hint, pqErr.Detail
-	} else if pgErr, ok := pgerror.GetPGCause(err); ok {
-		hint, detail = pgErr.Hint, pgErr.Detail
-	}
-	if detail != "" {
-		if printNewline {
-			fmt.Fprintln(w)
-			printNewline = false
-		}
-		fmt.Fprintln(w, "DETAIL:", detail)
-	}
-	if hint != "" {
-		if printNewline {
-			fmt.Fprintln(w)
-		}
-		fmt.Fprintln(w, "HINT:", hint)
-	}
 }
 
 func (c *cliState) doDecidePath() cliStateEnum {
@@ -1229,54 +1257,14 @@ func runInteractive(conn *sqlConn) (exitErr error) {
 		}
 		switch state {
 		case cliStart:
-			if len(sqlCtx.setStmts) > 0 {
-				// Execute any \set commands to allow setting client variables
-				// before statement execution non-interactive mode.
-				for i := range sqlCtx.setStmts {
-					if c.handleSet(sqlCtx.setStmts[i:i+1], cliStart, cliStop) == cliStop {
-						return c.exitErr
-					}
-				}
+			cleanupFn, err := c.configurePreShellDefaults()
+			defer cleanupFn()
+			if err != nil {
+				return err
 			}
-
 			if len(sqlCtx.execStmts) > 0 {
 				// Single-line sql; run as simple as possible, without noise on stdout.
 				return c.runStatements(sqlCtx.execStmts)
-			}
-
-			if cliCtx.terminalOutput {
-				// If results are shown on a terminal also enable printing of
-				// times by default.
-				cliCtx.showTimes = true
-			}
-
-			// An interactive readline prompter is comparatively slow at
-			// reading input, so we only use it in interactive mode and when
-			// there is also a terminal on stdout.
-			if cliCtx.isInteractive && cliCtx.terminalOutput {
-				// The readline initialization is not placed in
-				// the doStart() method because of the defer.
-				c.ins, c.exitErr = readline.InitFiles("cockroach",
-					true, /* wideChars */
-					stdin, os.Stdout, stderr)
-				if c.exitErr == readline.ErrWidecharNotSupported {
-					log.Warning(context.TODO(), "wide character support disabled")
-					c.ins, c.exitErr = readline.InitFiles("cockroach",
-						false, stdin, os.Stdout, stderr)
-				}
-				if c.exitErr != nil {
-					return c.exitErr
-				}
-				// If the user has used bind -v or bind -l in their ~/.editrc,
-				// this will reset the standard bindings. However we really
-				// want in this shell that Ctrl+C, tab, Ctrl+Z and Ctrl+R
-				// always have the same meaning.  So reload these bindings
-				// explicitly no matter what ~/.editrc may have changed.
-				c.ins.RebindControlKeys()
-				defer c.ins.Close()
-			} else {
-				c.ins = noLineEditor
-				c.buf = bufio.NewReader(stdin)
 			}
 
 			state = c.doStart(cliStartLine)
@@ -1321,34 +1309,143 @@ func runInteractive(conn *sqlConn) (exitErr error) {
 	return c.exitErr
 }
 
+// configurePreShellDefaults should be called after command-line flags
+// have been loaded into the cliCtx/sqlCtx and .isInteractive /
+// .terminalOutput have been initialized, but before the SQL shell or
+// execution starts.
+//
+// The returned cleanupFn must be called even when the err return is
+// not nil.
+func (c *cliState) configurePreShellDefaults() (cleanupFn func(), err error) {
+	if cliCtx.terminalOutput {
+		// If results are shown on a terminal also enable printing of
+		// times by default.
+		sqlCtx.showTimes = true
+	}
+
+	if cliCtx.isInteractive {
+		// If a human user is providing the input, we want to help them with
+		// what they are entering:
+		c.errExit = false // let the user retry failing commands
+		if !sqlCtx.debugMode {
+			// Also, try to enable syntax checking if supported by the server.
+			// This is a form of client-side error checking to help with large txns.
+			c.tryEnableCheckSyntax()
+		}
+	} else {
+		// When running non-interactive, by default we want errors to stop
+		// further processing and we can just let syntax checking to be
+		// done server-side to avoid client-side churn.
+		c.errExit = true
+		c.checkSyntax = false
+		// We also don't need (smart) prompts at all.
+	}
+
+	// An interactive readline prompter is comparatively slow at
+	// reading input, so we only use it in interactive mode and when
+	// there is also a terminal on stdout.
+	if cliCtx.isInteractive && cliCtx.terminalOutput {
+		// The readline initialization is not placed in
+		// the doStart() method because of the defer.
+		c.ins, c.exitErr = readline.InitFiles("cockroach",
+			true, /* wideChars */
+			stdin, os.Stdout, stderr)
+		if errors.Is(c.exitErr, readline.ErrWidecharNotSupported) {
+			log.Warning(context.TODO(), "wide character support disabled")
+			c.ins, c.exitErr = readline.InitFiles("cockroach",
+				false, stdin, os.Stdout, stderr)
+		}
+		if c.exitErr != nil {
+			return cleanupFn, c.exitErr
+		}
+		// If the user has used bind -v or bind -l in their ~/.editrc,
+		// this will reset the standard bindings. However we really
+		// want in this shell that Ctrl+C, tab, Ctrl+Z and Ctrl+R
+		// always have the same meaning.  So reload these bindings
+		// explicitly no matter what ~/.editrc may have changed.
+		c.ins.RebindControlKeys()
+		cleanupFn = func() { c.ins.Close() }
+	} else {
+		c.ins = noLineEditor
+		c.buf = bufio.NewReader(stdin)
+		cleanupFn = func() {}
+	}
+
+	if c.hasEditor() {
+		// We only enable prompt and history management when the
+		// interactive input prompter is enabled. This saves on churn and
+		// memory when e.g. piping a large SQL script through the
+		// command-line client.
+
+		// Default prompt is part of the connection URL. eg: "marc@localhost:26257>".
+		c.customPromptPattern = defaultPromptPattern
+		if sqlCtx.debugMode {
+			c.customPromptPattern = debugPromptPattern
+		}
+
+		c.ins.SetCompleter(c)
+		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
+			log.Warningf(context.TODO(), "cannot enable history: %v", err)
+		} else {
+			homeDir, err := envutil.HomeDir()
+			if err != nil {
+				log.Warningf(context.TODO(), "cannot retrieve user information: %v", err)
+				log.Warning(context.TODO(), "history will not be saved")
+			} else {
+				histFile := filepath.Join(homeDir, cmdHistFile)
+				err = c.ins.LoadHistory(histFile)
+				if err != nil {
+					log.Warningf(context.TODO(), "cannot load the command-line history (file corrupted?): %v", err)
+					log.Warning(context.TODO(), "the history file will be cleared upon first entry")
+				}
+				c.ins.SetAutoSaveHistory(histFile, true)
+			}
+		}
+	}
+
+	// After all the local options have been computed/initialized above,
+	// process any overrides from the command line.
+	for i := range sqlCtx.setStmts {
+		if c.handleSet(sqlCtx.setStmts[i:i+1], cliStart, cliStop) == cliStop {
+			return cleanupFn, c.exitErr
+		}
+	}
+	return cleanupFn, nil
+}
+
 // runOneStatement executes one statement and terminates
 // on error.
 func (c *cliState) runStatements(stmts []string) error {
-	for i, stmt := range stmts {
-		// We do not use the logic from doRunStatement here
-		// because we need a different error handling mechanism:
-		// the error, if any, must not be printed to stderr if
-		// we are returning directly.
-		c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(stmt))
-		if c.exitErr != nil {
-			if !c.errExit && i < len(stmts)-1 {
-				// Print the error now because we don't get a chance later.
-				fmt.Fprintln(stderr, c.exitErr)
-				maybeShowErrorDetails(stderr, c.exitErr, false)
-			}
-			if c.errExit {
-				break
+	for {
+		for i, stmt := range stmts {
+			// We do not use the logic from doRunStatement here
+			// because we need a different error handling mechanism:
+			// the error, if any, must not be printed to stderr if
+			// we are returning directly.
+			c.exitErr = runQueryAndFormatResults(c.conn, os.Stdout, makeQuery(stmt))
+			if c.exitErr != nil {
+				if !c.errExit && i < len(stmts)-1 {
+					// Print the error now because we don't get a chance later.
+					cliOutputError(stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+				}
+				if c.errExit {
+					break
+				}
 			}
 		}
+		// If --watch was specified and no error was encountered,
+		// repeat.
+		if sqlCtx.repeatDelay > 0 && c.exitErr == nil {
+			time.Sleep(sqlCtx.repeatDelay)
+			continue
+		}
+		break
 	}
 
 	if c.exitErr != nil {
 		// Don't write the error to stderr ourselves. Cobra will do this for
 		// us on the exit path. We do want the details though, so add them.
-		var buf bytes.Buffer
-		fmt.Fprintln(&buf, c.exitErr)
-		maybeShowErrorDetails(&buf, c.exitErr, false)
-		c.exitErr = errors.New(strings.TrimSuffix(buf.String(), "\n"))
+		c.exitErr = &formattedError{err: c.exitErr, showSeverity: true, verbose: false}
 	}
 	return c.exitErr
 }
@@ -1369,11 +1466,11 @@ func runTerm(cmd *cobra.Command, args []string) error {
 	checkInteractive()
 
 	if cliCtx.isInteractive {
-		// The user only gets to see the info screen on interactive sessions.
-		fmt.Print(infoMessage)
+		// The user only gets to see the welcome message on interactive sessions.
+		fmt.Print(welcomeMessage)
 	}
 
-	conn, err := getPasswordAndMakeSQLClient("cockroach sql")
+	conn, err := makeSQLClient("cockroach sql", useDefaultDb)
 	if err != nil {
 		return err
 	}
@@ -1428,7 +1525,7 @@ func setupSafeUpdates(cmd *cobra.Command, conn *sqlConn) {
 // by the server.
 func (c *cliState) tryEnableCheckSyntax() {
 	if err := c.conn.Exec("SHOW SYNTAX 'SHOW SYNTAX ''1'';'", nil); err != nil {
-		fmt.Fprintf(stderr, "warning: cannot enable check_syntax: %v", err)
+		fmt.Fprintf(stderr, "warning: cannot enable check_syntax: %v\n", err)
 	} else {
 		c.checkSyntax = true
 	}
@@ -1437,25 +1534,18 @@ func (c *cliState) tryEnableCheckSyntax() {
 // serverSideParse uses the SHOW SYNTAX statement to analyze the given string.
 // If the syntax is correct, the function returns the statement
 // decomposition in the first return value. If it is not, the function
-// assembles a pgerror.Error with suitable Detail and Hint fields.
-func (c *cliState) serverSideParse(sql string) (stmts []string, pgErr *pgerror.Error) {
+// extracts a help string if available.
+func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 	cols, rows, err := runQuery(c.conn, makeQuery("SHOW SYNTAX "+lex.EscapeSQLString(sql)), true)
 	if err != nil {
 		// The query failed with some error. This is not a syntax error
 		// detected by SHOW SYNTAX (those show up as valid rows) but
-		// instead something else. Do our best to convert that something
-		// else back to a pgerror.Error.
-		if pgErr, ok := err.(*pgerror.Error); ok {
-			return nil, pgErr
-		} else if pqErr, ok := err.(*pq.Error); ok {
-			return nil, pgerror.NewError(
-				string(pqErr.Code), pqErr.Message).SetHintf("%s", pqErr.Hint).SetDetailf("%s", pqErr.Detail)
-		}
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError, "%v", err)
+		// instead something else.
+		return "", errors.Wrap(err, "unexpected error")
 	}
 
 	if len(cols) < 2 {
-		return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
+		return "", errors.Newf(
 			"invalid results for SHOW SYNTAX: %q %q", cols, rows)
 	}
 
@@ -1474,17 +1564,22 @@ func (c *cliState) serverSideParse(sql string) (stmts []string, pgErr *pgerror.E
 				code = row[1]
 			}
 		}
-		return nil, pgerror.NewError(code, message).SetHintf("%s", hint).SetDetailf("%s", detail)
-	}
-
-	// Otherwise, hopefully we got some SQL statements.
-	stmts = make([]string, len(rows))
-	for i := range rows {
-		if rows[i][0] != "sql" {
-			return nil, pgerror.NewErrorf(pgerror.CodeInternalError,
-				"invalid results for SHOW SYNTAX: %q %q", cols, rows)
+		// Is it a help text?
+		if strings.HasPrefix(message, "help token in input") && strings.HasPrefix(hint, "help:") {
+			// Yes: return it.
+			helpText = hint[6:]
+			hint = ""
 		}
-		stmts[i] = rows[i][1]
+		// In any case report that there was an error while parsing.
+		err := errors.Newf("%s", message)
+		err = pgerror.WithCandidateCode(err, pgcode.MakeCode(code))
+		if hint != "" {
+			err = errors.WithHint(err, hint)
+		}
+		if detail != "" {
+			err = errors.WithDetail(err, detail)
+		}
+		return helpText, err
 	}
-	return stmts, nil
+	return "", nil
 }

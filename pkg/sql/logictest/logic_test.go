@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package logictest
 
@@ -33,27 +29,11 @@ import (
 // See the comments in logic.go for more details.
 func TestLogic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	RunLogicTest(t, "testdata/logic_test/[^.]*")
+	RunLogicTest(t, TestServerArgs{}, "testdata/logic_test/[^.]*")
 }
 
-// TestPlannerLogic tests the heuristic planner by running EXPLAIN and SHOW
-// TRACE queries that show the plan that was produced. These tests are split
-// off from the TestLogic tests because the expected output is specific to how
-// the planner works. The cost-based optimizer will often return different
-// results for the same EXPLAIN statement, as it often chooses different ways
-// to execute the same logical query. Note that the cost-based optimizer tests
-// are housed in the various sql/opt packages.
-func TestPlannerLogic(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	RunLogicTest(t, "testdata/planner_test/[^.]*")
-}
-
-// TestSqlLiteLogic runs the subset of SqlLite logic tests that do not require
-// support for correlated subqueries. The heuristic planner does not support
-// correlated subqueries, so until that is fully deprecated, it can only run
-// this subset.
-//
-// See the comments for runSQLLiteLogicTest for more detail on these tests.
+// TestSqlLiteLogic runs the supported SqlLite logic tests. See the comments
+// for runSQLLiteLogicTest for more detail on these tests.
 func TestSqlLiteLogic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	runSQLLiteLogicTest(t,
@@ -65,6 +45,14 @@ func TestSqlLiteLogic(t *testing.T) {
 		"/test/index/orderby_nosort/*/*.test",
 		"/test/index/view/*/*.test",
 
+		"/test/select1.test",
+		"/test/select2.test",
+		"/test/select3.test",
+		"/test/select4.test",
+
+		// TODO(andyk): No support for join ordering yet, so this takes too long.
+		// "/test/select5.test",
+
 		// TODO(pmattis): Incompatibilities in numeric types.
 		// For instance, we type SUM(int) as a decimal since all of our ints are
 		// int64.
@@ -75,24 +63,6 @@ func TestSqlLiteLogic(t *testing.T) {
 		// "/test/random/aggregates/*.test",
 		// "/test/random/groupby/*.test",
 		// "/test/random/select/*.test",
-	)
-}
-
-// TestSqlLiteCorrelatedLogic runs the subset of SqlLite logic tests that
-// require support for correlated subqueries. The cost-based optimizer has this
-// support, whereas the heuristic planner does not.
-//
-// See the comments for runSQLLiteLogicTest for more detail on these tests.
-func TestSqlLiteCorrelatedLogic(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	runSQLLiteLogicTest(t,
-		"/test/select1.test",
-		"/test/select2.test",
-		"/test/select3.test",
-		"/test/select4.test",
-
-		// TODO(andyk): No support for join ordering yet, so this takes too long.
-		// "/test/select5.test",
 	)
 }
 
@@ -135,5 +105,10 @@ func runSQLLiteLogicTest(t *testing.T, globs ...string) {
 		prefixedGlobs[i] = logicTestPath + glob
 	}
 
-	RunLogicTest(t, prefixedGlobs...)
+	// SQLLite logic tests can be very disk (with '-disk' configs) intensive,
+	// so we give them larger temp storage limit than other logic tests get.
+	serverArgs := TestServerArgs{
+		tempStorageDiskLimit: 512 << 20, // 512 MiB
+	}
+	RunLogicTest(t, serverArgs, prefixedGlobs...)
 }

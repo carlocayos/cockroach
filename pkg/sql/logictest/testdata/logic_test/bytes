@@ -1,5 +1,3 @@
-# LogicTest: local local-opt local-parallel-stmts fakedist fakedist-opt fakedist-metadata
-
 query T
 SHOW bytea_output
 ----
@@ -50,6 +48,9 @@ query T
 SELECT '日本語':::STRING::BYTES::STRING
 ----
 \xe697a5e69cace8aa9e
+
+query error invalid bytea escape sequence
+SELECT '\400'::bytea
 
 statement ok
 SET bytea_output = escape

@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 import _ from "lodash";
 import * as nvd3 from "nvd3";
@@ -6,7 +16,7 @@ import moment from "moment";
 
 import * as protos from "src/js/protos";
 import { NanoToMilli } from "src/util/convert";
-import { Bytes, ComputeByteScale, ComputeDurationScale, Duration } from "src/util/format";
+import {  DurationFitScale, BytesFitScale, ComputeByteScale, ComputeDurationScale} from "src/util/format";
 
 import {
   MetricProps, AxisProps, AxisUnits, QueryTimeInfo,
@@ -16,7 +26,7 @@ type TSResponse = protos.cockroach.ts.tspb.TimeSeriesQueryResponse;
 
 // Global set of colors for graph series.
 const seriesPalette = [
-  "#5F6C87", "#F2BE2C", "#F16969", "#4E9FD1", "#49D990", "#D77FBF", "#87326D", "#A3415B",
+  "#475872", "#FFCD02", "#F16969", "#4E9FD1", "#49D990", "#D77FBF", "#87326D", "#A3415B",
   "#B59153", "#C9DB6D", "#203D9B", "#748BF2", "#91C8F2", "#FF9696", "#EF843C", "#DCCD4B",
 ];
 
@@ -63,7 +73,10 @@ class AxisDomain {
     const max = extent[1];
     if (alignMinMax) {
       const alignedMin = min - min % increment;
-      const alignedMax = max - max % increment + increment;
+      let alignedMax = max;
+      if (max % increment !== 0) {
+        alignedMax = max - max % increment + increment;
+      }
       this.extent = [alignedMin, alignedMax];
     } else {
       this.extent = extent;
@@ -159,7 +172,7 @@ function ComputeByteAxisDomain(extent: Extent): AxisDomain {
 
   axisDomain.label = scale.units;
 
-  axisDomain.guideFormat = Bytes;
+  axisDomain.guideFormat = BytesFitScale(scale.units);
   return axisDomain;
 }
 
@@ -171,7 +184,7 @@ function ComputeDurationAxisDomain(extent: Extent): AxisDomain {
 
   axisDomain.label = scale.units;
 
-  axisDomain.guideFormat = Duration;
+  axisDomain.guideFormat = DurationFitScale(scale.units);
   return axisDomain;
 }
 
@@ -338,7 +351,6 @@ export function ConfigureLineChart(
   axis: React.ReactElement<AxisProps>,
   data: TSResponse,
   timeInfo: QueryTimeInfo,
-  hoverTime?: moment.Moment,
 ) {
   chart.showLegend(metrics.length > 1 && metrics.length <= MAX_LEGEND_SERIES);
   let formattedData: formattedSeries[];
@@ -383,11 +395,25 @@ export function ConfigureLineChart(
   } catch (e) {
     console.log("Error rendering graph: ", e);
   }
+}
 
-  const xScale = chart.xAxis.scale();
-  const yScale = chart.yAxis.scale();
-  const yExtent: Extent = data ? [yScale(yAxisDomain.extent[0]), yScale(yAxisDomain.extent[1])] : [0, 1];
-  updateLinkedGuideline(svgEl, xScale, yExtent, hoverTime);
+/**
+ * ConfigureLinkedGuide renders the linked guideline for a chart.
+ */
+export function ConfigureLinkedGuideline(
+  chart: nvd3.LineChart,
+  svgEl: SVGElement,
+  axis: React.ReactElement<AxisProps>,
+  data: TSResponse,
+  hoverTime: moment.Moment,
+) {
+  if (data) {
+    const xScale = chart.xAxis.scale();
+    const yScale = chart.yAxis.scale();
+    const yAxisDomain = calculateYAxisDomain(axis.props.units, data);
+    const yExtent: Extent = data ? [yScale(yAxisDomain.extent[0]), yScale(yAxisDomain.extent[1])] : [0, 1];
+    updateLinkedGuideline(svgEl, xScale, yExtent, hoverTime);
+  }
 }
 
 // updateLinkedGuideline is responsible for maintaining "linked" guidelines on

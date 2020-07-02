@@ -1,27 +1,20 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package security
-
-// TODO(jqmp): The use of TLS here is just a proof of concept; its security
-// properties haven't been analyzed or audited.
 
 import (
 	"crypto/tls"
 	"crypto/x509"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // EmbeddedCertsDir is the certs directory inside embedded assets.
@@ -40,6 +33,15 @@ const (
 	EmbeddedRootKey      = "client.root.key"
 	EmbeddedTestUserCert = "client.testuser.crt"
 	EmbeddedTestUserKey  = "client.testuser.key"
+
+	EmbeddedTenantID           = 123456789
+	EmbeddedTenantCertsDir     = "test_certs/mt"
+	EmbeddedTenantServerCACert = "ca-server-tenant.crt"        // CA for tenant server (KV server)
+	EmbeddedTenantServerCert   = "server-tenant.crt"           // tenant server (KV server) cert
+	EmbeddedTenantServerKey    = "server-tenant.key"           // tenant server (KV server) key
+	EmbeddedTenantClientCACert = "ca-client-tenant.crt"        // CA for client connections (auth broker)
+	EmbeddedTenantClientCert   = "client-tenant.123456789.crt" // tenant client cert (SQL server)
+	EmbeddedTenantClientKey    = "client-tenant.123456789.key" // tenant client key (SQL server)
 )
 
 // LoadServerTLSConfig creates a server TLSConfig by loading the CA and server certs.

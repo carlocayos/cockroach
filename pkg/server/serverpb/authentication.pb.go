@@ -7,8 +7,10 @@ import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
 
-import context "context"
-import grpc "google.golang.org/grpc"
+import (
+	context "context"
+	grpc "google.golang.org/grpc"
+)
 
 import io "io"
 
@@ -16,6 +18,12 @@ import io "io"
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
 
 // UserLoginRequest contains credentials a user must provide to log in.
 type UserLoginRequest struct {
@@ -25,10 +33,34 @@ type UserLoginRequest struct {
 	Password string `protobuf:"bytes,2,opt,name=password,proto3" json:"password,omitempty"`
 }
 
-func (m *UserLoginRequest) Reset()                    { *m = UserLoginRequest{} }
-func (m *UserLoginRequest) String() string            { return proto.CompactTextString(m) }
-func (*UserLoginRequest) ProtoMessage()               {}
-func (*UserLoginRequest) Descriptor() ([]byte, []int) { return fileDescriptorAuthentication, []int{0} }
+func (m *UserLoginRequest) Reset()         { *m = UserLoginRequest{} }
+func (m *UserLoginRequest) String() string { return proto.CompactTextString(m) }
+func (*UserLoginRequest) ProtoMessage()    {}
+func (*UserLoginRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_authentication_38fb587d3f7ced6d, []int{0}
+}
+func (m *UserLoginRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *UserLoginRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *UserLoginRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_UserLoginRequest.Merge(dst, src)
+}
+func (m *UserLoginRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *UserLoginRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_UserLoginRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_UserLoginRequest proto.InternalMessageInfo
 
 // UserLoginResponse is currently empty. If a login is successful, an HTTP
 // Set-Cookie header will be added to the response with a session
@@ -36,10 +68,34 @@ func (*UserLoginRequest) Descriptor() ([]byte, []int) { return fileDescriptorAut
 type UserLoginResponse struct {
 }
 
-func (m *UserLoginResponse) Reset()                    { *m = UserLoginResponse{} }
-func (m *UserLoginResponse) String() string            { return proto.CompactTextString(m) }
-func (*UserLoginResponse) ProtoMessage()               {}
-func (*UserLoginResponse) Descriptor() ([]byte, []int) { return fileDescriptorAuthentication, []int{1} }
+func (m *UserLoginResponse) Reset()         { *m = UserLoginResponse{} }
+func (m *UserLoginResponse) String() string { return proto.CompactTextString(m) }
+func (*UserLoginResponse) ProtoMessage()    {}
+func (*UserLoginResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_authentication_38fb587d3f7ced6d, []int{1}
+}
+func (m *UserLoginResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *UserLoginResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *UserLoginResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_UserLoginResponse.Merge(dst, src)
+}
+func (m *UserLoginResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *UserLoginResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_UserLoginResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_UserLoginResponse proto.InternalMessageInfo
 
 // UserLogoutRequest will terminate the current session in use. The request
 // is empty because the current session is identified by an HTTP cookie on the
@@ -47,18 +103,66 @@ func (*UserLoginResponse) Descriptor() ([]byte, []int) { return fileDescriptorAu
 type UserLogoutRequest struct {
 }
 
-func (m *UserLogoutRequest) Reset()                    { *m = UserLogoutRequest{} }
-func (m *UserLogoutRequest) String() string            { return proto.CompactTextString(m) }
-func (*UserLogoutRequest) ProtoMessage()               {}
-func (*UserLogoutRequest) Descriptor() ([]byte, []int) { return fileDescriptorAuthentication, []int{2} }
+func (m *UserLogoutRequest) Reset()         { *m = UserLogoutRequest{} }
+func (m *UserLogoutRequest) String() string { return proto.CompactTextString(m) }
+func (*UserLogoutRequest) ProtoMessage()    {}
+func (*UserLogoutRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_authentication_38fb587d3f7ced6d, []int{2}
+}
+func (m *UserLogoutRequest) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *UserLogoutRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *UserLogoutRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_UserLogoutRequest.Merge(dst, src)
+}
+func (m *UserLogoutRequest) XXX_Size() int {
+	return m.Size()
+}
+func (m *UserLogoutRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_UserLogoutRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_UserLogoutRequest proto.InternalMessageInfo
 
 type UserLogoutResponse struct {
 }
 
-func (m *UserLogoutResponse) Reset()                    { *m = UserLogoutResponse{} }
-func (m *UserLogoutResponse) String() string            { return proto.CompactTextString(m) }
-func (*UserLogoutResponse) ProtoMessage()               {}
-func (*UserLogoutResponse) Descriptor() ([]byte, []int) { return fileDescriptorAuthentication, []int{3} }
+func (m *UserLogoutResponse) Reset()         { *m = UserLogoutResponse{} }
+func (m *UserLogoutResponse) String() string { return proto.CompactTextString(m) }
+func (*UserLogoutResponse) ProtoMessage()    {}
+func (*UserLogoutResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_authentication_38fb587d3f7ced6d, []int{3}
+}
+func (m *UserLogoutResponse) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *UserLogoutResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *UserLogoutResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_UserLogoutResponse.Merge(dst, src)
+}
+func (m *UserLogoutResponse) XXX_Size() int {
+	return m.Size()
+}
+func (m *UserLogoutResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_UserLogoutResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_UserLogoutResponse proto.InternalMessageInfo
 
 // SessionCookie is a message used to encode the authentication cookie returned
 // from successful login requests.
@@ -69,10 +173,34 @@ type SessionCookie struct {
 	Secret []byte `protobuf:"bytes,2,opt,name=secret,proto3" json:"secret,omitempty"`
 }
 
-func (m *SessionCookie) Reset()                    { *m = SessionCookie{} }
-func (m *SessionCookie) String() string            { return proto.CompactTextString(m) }
-func (*SessionCookie) ProtoMessage()               {}
-func (*SessionCookie) Descriptor() ([]byte, []int) { return fileDescriptorAuthentication, []int{4} }
+func (m *SessionCookie) Reset()         { *m = SessionCookie{} }
+func (m *SessionCookie) String() string { return proto.CompactTextString(m) }
+func (*SessionCookie) ProtoMessage()    {}
+func (*SessionCookie) Descriptor() ([]byte, []int) {
+	return fileDescriptor_authentication_38fb587d3f7ced6d, []int{4}
+}
+func (m *SessionCookie) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *SessionCookie) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	b = b[:cap(b)]
+	n, err := m.MarshalTo(b)
+	if err != nil {
+		return nil, err
+	}
+	return b[:n], nil
+}
+func (dst *SessionCookie) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SessionCookie.Merge(dst, src)
+}
+func (m *SessionCookie) XXX_Size() int {
+	return m.Size()
+}
+func (m *SessionCookie) XXX_DiscardUnknown() {
+	xxx_messageInfo_SessionCookie.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SessionCookie proto.InternalMessageInfo
 
 func init() {
 	proto.RegisterType((*UserLoginRequest)(nil), "cockroach.server.serverpb.UserLoginRequest")
@@ -90,8 +218,9 @@ var _ grpc.ClientConn
 // is compatible with the grpc package it is being compiled against.
 const _ = grpc.SupportPackageIsVersion4
 
-// Client API for LogIn service
-
+// LogInClient is the client API for LogIn service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
 type LogInClient interface {
 	// UserLogin is used to create a web authentication session.
 	UserLogin(ctx context.Context, in *UserLoginRequest, opts ...grpc.CallOption) (*UserLoginResponse, error)
@@ -107,15 +236,14 @@ func NewLogInClient(cc *grpc.ClientConn) LogInClient {
 
 func (c *logInClient) UserLogin(ctx context.Context, in *UserLoginRequest, opts ...grpc.CallOption) (*UserLoginResponse, error) {
 	out := new(UserLoginResponse)
-	err := grpc.Invoke(ctx, "/cockroach.server.serverpb.LogIn/UserLogin", in, out, c.cc, opts...)
+	err := c.cc.Invoke(ctx, "/cockroach.server.serverpb.LogIn/UserLogin", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// Server API for LogIn service
-
+// LogInServer is the server API for LogIn service.
 type LogInServer interface {
 	// UserLogin is used to create a web authentication session.
 	UserLogin(context.Context, *UserLoginRequest) (*UserLoginResponse, error)
@@ -156,8 +284,9 @@ var _LogIn_serviceDesc = grpc.ServiceDesc{
 	Metadata: "server/serverpb/authentication.proto",
 }
 
-// Client API for LogOut service
-
+// LogOutClient is the client API for LogOut service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
 type LogOutClient interface {
 	// UserLogout terminates an active authentication session.
 	UserLogout(ctx context.Context, in *UserLogoutRequest, opts ...grpc.CallOption) (*UserLogoutResponse, error)
@@ -173,15 +302,14 @@ func NewLogOutClient(cc *grpc.ClientConn) LogOutClient {
 
 func (c *logOutClient) UserLogout(ctx context.Context, in *UserLogoutRequest, opts ...grpc.CallOption) (*UserLogoutResponse, error) {
 	out := new(UserLogoutResponse)
-	err := grpc.Invoke(ctx, "/cockroach.server.serverpb.LogOut/UserLogout", in, out, c.cc, opts...)
+	err := c.cc.Invoke(ctx, "/cockroach.server.serverpb.LogOut/UserLogout", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// Server API for LogOut service
-
+// LogOutServer is the server API for LogOut service.
 type LogOutServer interface {
 	// UserLogout terminates an active authentication session.
 	UserLogout(context.Context, *UserLogoutRequest) (*UserLogoutResponse, error)
@@ -345,6 +473,9 @@ func encodeVarintAuthentication(dAtA []byte, offset int, v uint64) int {
 	return offset + 1
 }
 func (m *UserLoginRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	l = len(m.Username)
@@ -359,24 +490,36 @@ func (m *UserLoginRequest) Size() (n int) {
 }
 
 func (m *UserLoginResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	return n
 }
 
 func (m *UserLogoutRequest) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	return n
 }
 
 func (m *UserLogoutResponse) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	return n
 }
 
 func (m *SessionCookie) Size() (n int) {
+	if m == nil {
+		return 0
+	}
 	var l int
 	_ = l
 	if m.ID != 0 {
@@ -865,31 +1008,34 @@ var (
 	ErrIntOverflowAuthentication   = fmt.Errorf("proto: integer overflow")
 )
 
-func init() { proto.RegisterFile("server/serverpb/authentication.proto", fileDescriptorAuthentication) }
+func init() {
+	proto.RegisterFile("server/serverpb/authentication.proto", fileDescriptor_authentication_38fb587d3f7ced6d)
+}
 
-var fileDescriptorAuthentication = []byte{
-	// 368 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8c, 0x92, 0x4d, 0x4b, 0xeb, 0x40,
-	0x14, 0x86, 0x3b, 0xb9, 0xdc, 0xdc, 0x76, 0xee, 0xbd, 0x68, 0xc7, 0x52, 0x6a, 0x90, 0x28, 0xc1,
-	0x85, 0xf8, 0x91, 0x40, 0xdd, 0xb9, 0x11, 0xaa, 0x9b, 0x4a, 0x41, 0x88, 0xb8, 0x71, 0x97, 0xa6,
-	0xc3, 0x74, 0x68, 0x9d, 0x13, 0x67, 0x26, 0x8a, 0x2e, 0x8b, 0x3f, 0x40, 0xf0, 0x4f, 0x75, 0x29,
-	0xb8, 0x71, 0x25, 0x1a, 0xfd, 0x21, 0x92, 0x8f, 0x7e, 0x20, 0x08, 0x5d, 0x25, 0xe7, 0xbc, 0xef,
-	0xbc, 0xf3, 0x9c, 0xc3, 0xe0, 0x4d, 0x45, 0xe5, 0x35, 0x95, 0x5e, 0xfe, 0x89, 0xba, 0x5e, 0x10,
-	0xeb, 0x3e, 0x15, 0x9a, 0x87, 0x81, 0xe6, 0x20, 0xdc, 0x48, 0x82, 0x06, 0xb2, 0x1a, 0x42, 0x38,
-	0x90, 0x10, 0x84, 0x7d, 0x37, 0x37, 0xba, 0x13, 0xbf, 0x55, 0x63, 0xc0, 0x20, 0x73, 0x79, 0xe9,
-	0x5f, 0x7e, 0xc0, 0x5a, 0x63, 0x00, 0x6c, 0x48, 0xbd, 0x20, 0xe2, 0x5e, 0x20, 0x04, 0xe8, 0x2c,
-	0x4d, 0xe5, 0xaa, 0x73, 0x82, 0x97, 0xcf, 0x15, 0x95, 0x1d, 0x60, 0x5c, 0xf8, 0xf4, 0x2a, 0xa6,
-	0x4a, 0x13, 0x0b, 0x97, 0x63, 0x45, 0xa5, 0x08, 0x2e, 0x69, 0x03, 0x6d, 0xa0, 0xad, 0x8a, 0x3f,
-	0xad, 0x53, 0x2d, 0x0a, 0x94, 0xba, 0x01, 0xd9, 0x6b, 0x18, 0xb9, 0x36, 0xa9, 0x9d, 0x15, 0x5c,
-	0x9d, 0xcb, 0x52, 0x11, 0x08, 0x45, 0xe7, 0x9a, 0x10, 0xeb, 0xe2, 0x06, 0xa7, 0x86, 0xc9, 0x7c,
-	0xb3, 0xb0, 0x1e, 0xe2, 0xff, 0x67, 0x54, 0x29, 0x0e, 0xe2, 0x08, 0x60, 0xc0, 0x29, 0xa9, 0x63,
-	0x83, 0xf7, 0x32, 0x84, 0x5f, 0x2d, 0x33, 0x79, 0x5d, 0x37, 0xda, 0xc7, 0xbe, 0xc1, 0x7b, 0xa4,
-	0x8e, 0x4d, 0x45, 0x43, 0x49, 0x75, 0x86, 0xf0, 0xcf, 0x2f, 0xaa, 0xe6, 0x08, 0xe1, 0xdf, 0x1d,
-	0x60, 0x6d, 0x41, 0x6e, 0x71, 0x65, 0x8a, 0x42, 0x76, 0xdc, 0x1f, 0x77, 0xe6, 0x7e, 0x1f, 0xde,
-	0xda, 0x5d, 0xcc, 0x5c, 0x20, 0x57, 0x47, 0xcf, 0x9f, 0x8f, 0xc6, 0x5f, 0xc7, 0xf4, 0x86, 0x69,
-	0xff, 0x00, 0x6d, 0x37, 0xef, 0x11, 0x36, 0x3b, 0xc0, 0x4e, 0x63, 0x4d, 0xee, 0x30, 0x9e, 0x8d,
-	0x49, 0x16, 0x48, 0x9e, 0xad, 0xc8, 0xda, 0x5b, 0xd0, 0x5d, 0x80, 0x2c, 0x65, 0x20, 0x15, 0xf2,
-	0x27, 0x05, 0x81, 0x58, 0xb7, 0x9c, 0xf1, 0xbb, 0x5d, 0x1a, 0x27, 0x36, 0x7a, 0x4a, 0x6c, 0xf4,
-	0x92, 0xd8, 0xe8, 0x2d, 0xb1, 0xd1, 0xc3, 0x87, 0x5d, 0xba, 0x28, 0x4f, 0x72, 0xba, 0x66, 0xf6,
-	0x06, 0xf6, 0xbf, 0x02, 0x00, 0x00, 0xff, 0xff, 0x90, 0x5e, 0xcd, 0x55, 0x7a, 0x02, 0x00, 0x00,
+var fileDescriptor_authentication_38fb587d3f7ced6d = []byte{
+	// 378 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8c, 0x92, 0xcd, 0x6a, 0xdb, 0x40,
+	0x14, 0x85, 0x35, 0x2a, 0x55, 0xed, 0x69, 0x4b, 0xeb, 0xa9, 0x31, 0xae, 0x28, 0xd3, 0x22, 0xba,
+	0x28, 0x6e, 0x2b, 0x81, 0xb3, 0xcb, 0x26, 0xe0, 0x64, 0xe3, 0x60, 0x08, 0x28, 0x64, 0x93, 0x9d,
+	0x2c, 0x0f, 0xf2, 0x60, 0x67, 0xae, 0x32, 0x33, 0x4a, 0x48, 0x96, 0x26, 0x0f, 0x10, 0xc8, 0x4b,
+	0x79, 0x69, 0xc8, 0xc6, 0xab, 0x90, 0xc8, 0x79, 0x90, 0xa0, 0x1f, 0xff, 0x10, 0x08, 0x78, 0x25,
+	0xdd, 0x7b, 0xce, 0x9c, 0xf9, 0xee, 0x65, 0xf0, 0x6f, 0xc5, 0xe4, 0x05, 0x93, 0x5e, 0xf1, 0x89,
+	0xfb, 0x5e, 0x90, 0xe8, 0x21, 0x13, 0x9a, 0x87, 0x81, 0xe6, 0x20, 0xdc, 0x58, 0x82, 0x06, 0xf2,
+	0x3d, 0x84, 0x70, 0x24, 0x21, 0x08, 0x87, 0x6e, 0x61, 0x74, 0x97, 0x7e, 0xbb, 0x1e, 0x41, 0x04,
+	0xb9, 0xcb, 0xcb, 0xfe, 0x8a, 0x03, 0xf6, 0x8f, 0x08, 0x20, 0x1a, 0x33, 0x2f, 0x88, 0xb9, 0x17,
+	0x08, 0x01, 0x3a, 0x4f, 0x53, 0x85, 0xea, 0x1c, 0xe2, 0xaf, 0x27, 0x8a, 0xc9, 0x1e, 0x44, 0x5c,
+	0xf8, 0xec, 0x3c, 0x61, 0x4a, 0x13, 0x1b, 0x57, 0x12, 0xc5, 0xa4, 0x08, 0xce, 0x58, 0x13, 0xfd,
+	0x42, 0x7f, 0xaa, 0xfe, 0xaa, 0xce, 0xb4, 0x38, 0x50, 0xea, 0x12, 0xe4, 0xa0, 0x69, 0x16, 0xda,
+	0xb2, 0x76, 0xbe, 0xe1, 0xda, 0x46, 0x96, 0x8a, 0x41, 0x28, 0xb6, 0xd1, 0x84, 0x44, 0x97, 0x37,
+	0x38, 0x75, 0x4c, 0x36, 0x9b, 0xa5, 0x75, 0x0f, 0x7f, 0x3e, 0x66, 0x4a, 0x71, 0x10, 0xfb, 0x00,
+	0x23, 0xce, 0x48, 0x03, 0x9b, 0x7c, 0x90, 0x23, 0xbc, 0xeb, 0x58, 0xe9, 0xc3, 0x4f, 0xb3, 0x7b,
+	0xe0, 0x9b, 0x7c, 0x40, 0x1a, 0xd8, 0x52, 0x2c, 0x94, 0x4c, 0xe7, 0x08, 0x9f, 0xfc, 0xb2, 0x6a,
+	0x4f, 0x10, 0x7e, 0xdf, 0x83, 0xa8, 0x2b, 0xc8, 0x15, 0xae, 0xae, 0x50, 0xc8, 0x5f, 0xf7, 0xcd,
+	0x9d, 0xb9, 0xaf, 0x87, 0xb7, 0xff, 0x6d, 0x67, 0x2e, 0x91, 0x6b, 0x93, 0xfb, 0xe7, 0x3b, 0xf3,
+	0xa3, 0x63, 0x79, 0xe3, 0xac, 0xbf, 0x8b, 0x5a, 0xed, 0x1b, 0x84, 0xad, 0x1e, 0x44, 0x47, 0x89,
+	0x26, 0xd7, 0x18, 0xaf, 0xc7, 0x24, 0x5b, 0x24, 0xaf, 0x57, 0x64, 0xff, 0xdf, 0xd2, 0x5d, 0x82,
+	0x7c, 0xc9, 0x41, 0xaa, 0xe4, 0x43, 0x06, 0x02, 0x89, 0xee, 0xb4, 0xa6, 0x4f, 0xd4, 0x98, 0xa6,
+	0x14, 0xcd, 0x52, 0x8a, 0xe6, 0x29, 0x45, 0x8f, 0x29, 0x45, 0xb7, 0x0b, 0x6a, 0xcc, 0x16, 0xd4,
+	0x98, 0x2f, 0xa8, 0x71, 0x5a, 0x59, 0xe6, 0xf5, 0xad, 0xfc, 0x2d, 0xec, 0xbc, 0x04, 0x00, 0x00,
+	0xff, 0xff, 0x5e, 0xfd, 0xe4, 0x94, 0x82, 0x02, 0x00, 0x00,
 }

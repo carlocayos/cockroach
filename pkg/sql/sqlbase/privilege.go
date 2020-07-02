@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -180,6 +176,11 @@ func (p *PrivilegeDescriptor) Revoke(user string, privList privilege.List) {
 // * fixing default privileges for the "root" user
 // * fixing maximum privileges for users.
 // Returns true if the privilege descriptor was modified.
+//
+// TODO(ajwerner): Figure out whether this is still needed. It seems like
+// perhaps it was intended only for the 2.0 release but then somehow we got
+// bad descriptors with bad initial permissions into later versions or we didn't
+// properly bake this migration in.
 func (p *PrivilegeDescriptor) MaybeFixPrivileges(id ID) bool {
 	allowedPrivilegesBits := privilege.ALL.Mask()
 	if IsReservedID(id) {
@@ -275,7 +276,7 @@ func (p PrivilegeDescriptor) validateRequiredSuperuser(
 ) error {
 	superPriv, ok := p.findUser(user)
 	if !ok {
-		return fmt.Errorf("user %s does not have privileges", user)
+		return fmt.Errorf("user %s does not have privileges over system object with ID=%d", user, id)
 	}
 
 	// The super users must match the allowed privilege set exactly.

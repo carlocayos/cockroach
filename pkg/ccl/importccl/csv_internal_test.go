@@ -60,6 +60,7 @@ func TestMakeSimpleTableDescriptorErrors(t *testing.T) {
 		},
 	}
 	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext()
 	st := cluster.MakeTestingClusterSettings()
 	for _, tc := range tests {
 		t.Run(tc.stmt, func(t *testing.T) {
@@ -67,11 +68,11 @@ func TestMakeSimpleTableDescriptorErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			create, ok := stmt.(*tree.CreateTable)
+			create, ok := stmt.AST.(*tree.CreateTable)
 			if !ok {
 				t.Fatal("expected CREATE TABLE statement in table file")
 			}
-			_, err = MakeSimpleTableDescriptor(ctx, st, create, defaultCSVParentID, defaultCSVTableID, NoFKs, 0)
+			_, err = MakeSimpleTableDescriptor(ctx, &semaCtx, st, create, defaultCSVParentID, defaultCSVTableID, NoFKs, 0)
 			if !testutils.IsError(err, tc.error) {
 				t.Fatalf("expected %v, got %+v", tc.error, err)
 			}

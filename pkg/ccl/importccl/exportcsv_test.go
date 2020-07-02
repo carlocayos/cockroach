@@ -9,23 +9,29 @@
 package importccl_test
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
+	"github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/require"
 )
 
 func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, string, func()) {
@@ -35,24 +41,25 @@ func setupExportableBank(t *testing.T, nodes, rows int) (*sqlutils.SQLRunner, st
 	tc := testcluster.StartTestCluster(t, nodes,
 		base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: dir, UseDatabase: "test"}},
 	)
-	db := sqlutils.MakeSQLRunner(tc.Conns[0])
+	conn := tc.Conns[0]
+	db := sqlutils.MakeSQLRunner(conn)
 	db.Exec(t, "CREATE DATABASE test")
 
 	wk := bank.FromRows(rows)
-	if _, err := workload.Setup(ctx, db.DB, wk, 100, 3); err != nil {
+	l := workloadsql.InsertsDataLoader{BatchSize: 100, Concurrency: 3}
+	if _, err := workloadsql.Setup(ctx, conn, wk, l); err != nil {
 		t.Fatal(err)
 	}
 
 	config.TestingSetupZoneConfigHook(tc.Stopper())
-	v, err := tc.Servers[0].DB().Get(context.TODO(), keys.DescIDGenerator)
+	v, err := tc.Servers[0].DB().Get(context.Background(), keys.SystemSQLCodec.DescIDSequenceKey())
 	if err != nil {
 		t.Fatal(err)
 	}
-	last := uint32(v.ValueInt())
-	config.TestingSetZoneConfig(last+1, config.ZoneConfig{RangeMaxBytes: 5000})
-	if err := workload.Split(ctx, db.DB, wk.Tables()[0], 1 /* concurrency */); err != nil {
-		t.Fatal(err)
-	}
+	last := config.SystemTenantObjectID(v.ValueInt())
+	zoneConfig := zonepb.DefaultZoneConfig()
+	zoneConfig.RangeMaxBytes = proto.Int64(5000)
+	config.TestingSetZoneConfig(last+1, zoneConfig)
 	db.Exec(t, "ALTER TABLE bank SCATTER")
 	db.Exec(t, "SELECT 'force a scan to repopulate range cache' FROM [SELECT count(*) FROM bank]")
 
@@ -68,7 +75,7 @@ func TestExportImportBank(t *testing.T) {
 	db, dir, cleanup := setupExportableBank(t, 3, 100)
 	defer cleanup()
 
-	// Add some unicode to prove FmtParseDatums works as advertised.
+	// Add some unicode to prove FmtExport works as advertised.
 	db.Exec(t, "UPDATE bank SET payload = payload || '✅' WHERE id = 5")
 	db.Exec(t, "UPDATE bank SET payload = NULL WHERE id % 2 = 0")
 
@@ -81,8 +88,14 @@ func TestExportImportBank(t *testing.T) {
 		}
 		t.Run("null="+null, func(t *testing.T) {
 			var files []string
+
+			var asOf string
+			db.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&asOf)
+
 			for _, row := range db.QueryStr(t,
-				fmt.Sprintf(`EXPORT INTO CSV 'nodelocal:///t' WITH chunk_rows = $1, delimiter = '|' %s FROM TABLE bank`, nullAs), chunkSize,
+				fmt.Sprintf(`EXPORT INTO CSV 'nodelocal://0/t'
+					WITH chunk_rows = $1, delimiter = '|' %s
+					FROM SELECT * FROM bank AS OF SYSTEM TIME %s`, nullAs, asOf), chunkSize,
 			) {
 				files = append(files, row[0])
 				f, err := ioutil.ReadFile(filepath.Join(dir, "t", row[0]))
@@ -93,11 +106,11 @@ func TestExportImportBank(t *testing.T) {
 			}
 
 			schema := bank.FromRows(1).Tables()[0].Schema
-			fileList := "'nodelocal:///t/" + strings.Join(files, "', 'nodelocal:///t/") + "'"
+			fileList := "'nodelocal://0/t/" + strings.Join(files, "', 'nodelocal://0/t/") + "'"
 			db.Exec(t, fmt.Sprintf(`IMPORT TABLE bank2 %s CSV DATA (%s) WITH delimiter = '|'%s`, schema, fileList, nullIf))
 
 			db.CheckQueryResults(t,
-				`SELECT * FROM bank ORDER BY id`, db.QueryStr(t, `SELECT * FROM bank2 ORDER BY id`),
+				fmt.Sprintf(`SELECT * FROM bank AS OF SYSTEM TIME %s ORDER BY id`, asOf), db.QueryStr(t, `SELECT * FROM bank2 ORDER BY id`),
 			)
 			db.CheckQueryResults(t,
 				`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank2`, db.QueryStr(t, `SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE bank`),
@@ -120,7 +133,7 @@ func TestMultiNodeExportStmt(t *testing.T) {
 	for tries := 0; tries < maxTries; tries++ {
 		chunkSize := 13
 		rows := db.Query(t,
-			`EXPORT INTO CSV 'nodelocal:///t' WITH chunk_rows = $3 FROM SELECT * FROM bank WHERE id >= $1 and id < $2`,
+			`EXPORT INTO CSV 'nodelocal://0/t' WITH chunk_rows = $3 FROM SELECT * FROM bank WHERE id >= $1 and id < $2`,
 			10, 10+exportRows, chunkSize,
 		)
 
@@ -156,22 +169,6 @@ func TestMultiNodeExportStmt(t *testing.T) {
 	}
 }
 
-func TestExportNonTable(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	tc := testcluster.StartTestCluster(t, 3,
-		base.TestClusterArgs{ServerArgs: base.TestServerArgs{UseDatabase: "test"}},
-	)
-	defer tc.Stopper().Stop(context.Background())
-	db := sqlutils.MakeSQLRunner(tc.Conns[0])
-	db.Exec(t, "CREATE DATABASE test")
-
-	if _, err := db.DB.Exec(
-		`EXPORT INTO CSV 'nodelocal:///series' WITH chunk_rows = '10' FROM SELECT generate_series(1, 100)`,
-	); !testutils.IsError(err, "unsupported EXPORT query") {
-		t.Fatal(err)
-	}
-}
-
 func TestExportJoin(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	dir, cleanupDir := testutils.TempDir(t)
@@ -182,5 +179,148 @@ func TestExportJoin(t *testing.T) {
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `CREATE TABLE t AS VALUES (1, 2)`)
-	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal:///join' FROM SELECT * FROM t, t as u`)
+	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/join' FROM SELECT * FROM t, t as u`)
+}
+
+func TestExportOrder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `create table foo (i int primary key, x int, y int, z int, index (y))`)
+	sqlDB.Exec(t, `insert into foo values (1, 12, 3, 14), (2, 22, 2, 24), (3, 32, 1, 34)`)
+
+	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/order' from select * from foo order by y asc limit 2`)
+	content, err := ioutil.ReadFile(filepath.Join(dir, "order", "n1.0.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected, got := "3,32,1,34\n2,22,2,24\n", string(content); expected != got {
+		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestExportUserDefinedTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	baseDir, cleanup := testutils.TempDir(t)
+	defer cleanup()
+	tc := testcluster.StartTestCluster(
+		t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{ExternalIODir: baseDir}})
+	defer tc.Stopper().Stop(ctx)
+	conn := tc.Conns[0]
+	sqlDB := sqlutils.MakeSQLRunner(conn)
+	// Set up some initial state for the tests.
+	sqlDB.Exec(t, `
+SET experimental_enable_enums = true;
+CREATE TYPE greeting AS ENUM ('hello', 'hi');
+CREATE TABLE greeting_table (x greeting, y greeting);
+INSERT INTO greeting_table VALUES ('hello', 'hello'), ('hi', 'hi');
+`)
+	tests := []struct {
+		stmt     string
+		expected string
+	}{
+		{
+			stmt:     "EXPORT INTO CSV 'nodelocal://0/test/' FROM (SELECT 'hello':::greeting, 'hi':::greeting)",
+			expected: "hello,hi\n",
+		},
+		{
+			stmt:     "EXPORT INTO CSV 'nodelocal://0/test/' FROM TABLE greeting_table",
+			expected: "hello,hello\nhi,hi\n",
+		},
+		{
+			stmt:     "EXPORT INTO CSV 'nodelocal://0/test/' FROM (SELECT x, y, enum_first(x) FROM greeting_table)",
+			expected: "hello,hello,hello\nhi,hi,hello\n",
+		},
+	}
+	for _, test := range tests {
+		sqlDB.Exec(t, test.stmt)
+		// Read the dumped file.
+		contents, err := ioutil.ReadFile(filepath.Join(baseDir, "test", "n1.0.csv"))
+		require.NoError(t, err)
+		require.Equal(t, test.expected, string(contents))
+	}
+}
+
+func TestExportOrderCompressed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+
+	var close = func(c io.Closer) {
+		if err := c.Close(); err != nil {
+			t.Fatalf("failed to close stream, got error %s", err)
+		}
+	}
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `create table foo (i int primary key, x int, y int, z int, index (y))`)
+	sqlDB.Exec(t, `insert into foo values (1, 12, 3, 14), (2, 22, 2, 24), (3, 32, 1, 34)`)
+
+	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/order' with compression = gzip from select * from foo order by y asc limit 2`)
+	fi, err := os.Open(filepath.Join(dir, "order", "n1.0.csv.gz"))
+	defer close(fi)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gzipReader, err := gzip.NewReader(fi)
+	defer close(gzipReader)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := ioutil.ReadAll(gzipReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if expected, got := "3,32,1,34\n2,22,2,24\n", string(content); expected != got {
+		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+func TestExportShow(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `EXPORT INTO CSV 'nodelocal://0/show' FROM SELECT * FROM [SHOW DATABASES] ORDER BY database_name`)
+	content, err := ioutil.ReadFile(filepath.Join(dir, "show", "n1.0.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected, got := "defaultdb\npostgres\nsystem\n", string(content); expected != got {
+		t.Fatalf("expected %q, got %q", expected, got)
+	}
+}
+
+// TestExportVectorized makes sure that SupportsVectorized check doesn't panic
+// on CSVWriter processor.
+func TestExportVectorized(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	dir, cleanupDir := testutils.TempDir(t)
+	defer cleanupDir()
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{ExternalIODir: dir})
+	defer srv.Stopper().Stop(context.Background())
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	sqlDB.Exec(t, `CREATE TABLE t(a INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `SET vectorize_row_count_threshold=0`)
+	sqlDB.Exec(t, `EXPORT INTO CSV 'http://0.1:37957/exp_1' FROM TABLE t`)
 }

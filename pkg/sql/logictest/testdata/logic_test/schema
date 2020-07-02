@@ -1,0 +1,38 @@
+statement ok
+SET experimental_enable_user_defined_schemas = true
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS public
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS crdb_internal
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS pg_catalog
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS information_schema
+
+statement ok
+CREATE SCHEMA derp
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS derp
+
+statement error schema \"derp\" already exists
+CREATE SCHEMA derp
+
+statement error schema .* already exists
+CREATE SCHEMA public
+
+statement error schema .* already exists
+CREATE SCHEMA crdb_internal
+
+statement error schema .* already exists
+CREATE SCHEMA pg_catalog
+
+statement error schema .* already exists
+CREATE SCHEMA information_schema
+
+statement error pq: unacceptable schema name \"pg_temp\"
+CREATE SCHEMA pg_temp

@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * This module maintains the state of CockroachDB time series queries needed by
  * the web application. Cached query data is maintained separately for
@@ -7,7 +17,7 @@
 
 import _ from "lodash";
 import { Action } from "redux";
-import { delay } from "redux-saga";
+import { delay } from "redux-saga/effects";
 import { take, fork, call, all, put } from "redux-saga/effects";
 
 import * as protos from  "src/js/protos";
@@ -282,7 +292,7 @@ export function* queryMetricsSaga() {
     // Delay of zero will defer execution to the message queue, allowing the
     // currently executing event (e.g. rendering a new page or a timespan change)
     // to dispatch additional requests which can be batched.
-    yield call(delay, 0);
+    yield delay(0);
 
     const requestsToSend = requests;
     requests = [];

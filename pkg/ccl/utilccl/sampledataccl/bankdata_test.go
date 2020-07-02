@@ -51,7 +51,7 @@ func TestToBackup(t *testing.T) {
 		for _, chunkBytes := range chunkBytesSizes {
 			t.Run(fmt.Sprintf("rows=%d/chunk=%d", rows, chunkBytes), func(t *testing.T) {
 				dir := fmt.Sprintf("%d-%d", rows, chunkBytes)
-				data := bank.FromConfig(rows, payloadBytes, ranges).Tables()[0]
+				data := bank.FromConfig(rows, rows, payloadBytes, ranges).Tables()[0]
 				backup, err := toBackup(t, data, filepath.Join(outerDir, dir), chunkBytes)
 				if err != nil {
 					t.Fatalf("%+v", err)
@@ -61,7 +61,7 @@ func TestToBackup(t *testing.T) {
 					sqlDB := sqlutils.MakeSQLRunner(db)
 					sqlDB.Exec(t, `DROP DATABASE IF EXISTS data CASCADE`)
 					sqlDB.Exec(t, `CREATE DATABASE data`)
-					sqlDB.Exec(t, `RESTORE data.* FROM $1`, `nodelocal:///`+dir)
+					sqlDB.Exec(t, `RESTORE data.* FROM $1`, `nodelocal://0/`+dir)
 
 					var rowCount int
 					sqlDB.QueryRow(t, fmt.Sprintf(`SELECT count(*) FROM %s`, data.Name)).Scan(&rowCount)
@@ -73,7 +73,7 @@ func TestToBackup(t *testing.T) {
 				t.Run("NextKeyValues", func(t *testing.T) {
 					for _, requestedKVs := range []int{2, 3} {
 						newTableID := sqlbase.ID(keys.MaxReservedDescID + requestedKVs)
-						newTablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(newTableID)))
+						newTablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(newTableID))
 
 						keys := make(map[string]struct{}, rows)
 						for {

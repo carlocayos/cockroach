@@ -1,3 +1,13 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 /**
  * MetricQuery Components
  *
@@ -114,7 +124,7 @@ export interface MetricProps {
  * component should contain axes as children and use them only informationally
  * without rendering them.
  */
-export class Metric extends React.Component<MetricProps, {}> {
+export class Metric extends React.Component<MetricProps> {
   render(): React.ReactElement<any> {
     throw new Error("Component <Metric /> should never render.");
   }

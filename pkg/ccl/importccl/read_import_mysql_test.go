@@ -12,61 +12,38 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/kr/pretty"
+	mysql "vitess.io/vitess/go/vt/sqlparser"
 )
-
-var testEvalCtx = &tree.EvalContext{
-	SessionData: &sessiondata.SessionData{
-		DataConversion: sessiondata.DataConversionConfig{Location: time.UTC},
-	},
-	StmtTimestamp: timeutil.Unix(100000000, 0),
-}
-
-func descForTable(
-	t *testing.T, create string, parent, id sqlbase.ID, fks fkHandler,
-) *sqlbase.TableDescriptor {
-	t.Helper()
-	parsed, err := parser.ParseOne(create)
-	if err != nil {
-		t.Fatalf("could not parse %q: %v", create, err)
-	}
-	stmt := parsed.(*tree.CreateTable)
-	table, err := MakeSimpleTableDescriptor(context.TODO(), nil, stmt, parent, id, fks, testEvalCtx.StmtTimestamp.UnixNano())
-	if err != nil {
-		t.Fatalf("could interpret %q: %v", create, err)
-	}
-	if table.PrimaryIndex.Name == "primary" {
-		table.PrimaryIndex.Name = "PRIMARY"
-	}
-	if err := fixDescriptorFKState(table); err != nil {
-		t.Fatal(err)
-	}
-	return table
-}
 
 func TestMysqldumpDataReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	files := getMysqldumpTestdata(t)
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	table := descForTable(t, `CREATE TABLE simple (i INT PRIMARY KEY, s text, b bytea)`, 10, 20, NoFKs)
-	tables := map[string]*sqlbase.TableDescriptor{"simple": table}
+	tables := map[string]*execinfrapb.ReadImportDataSpec_ImportTable{"simple": {Desc: table}}
 
-	converter, err := newMysqldumpReader(make(chan kvBatch, 10), tables, testEvalCtx)
+	kvCh := make(chan row.KVBatch, 10)
+	converter, err := newMysqldumpReader(ctx, kvCh, tables, testEvalCtx)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,13 +58,12 @@ func TestMysqldumpDataReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer in.Close()
+	wrapped := &fileReader{Reader: in, counter: byteCounter{r: in}}
 
-	noop := func(_ bool) error { return nil }
-
-	if err := converter.readFile(ctx, in, 1, "", noop); err != nil {
+	if err := converter.readFile(ctx, wrapped, 1, 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	converter.inputFinished(ctx)
+	close(kvCh)
 
 	if expected, actual := len(simpleTestRows), len(res); expected != actual {
 		t.Fatalf("expected %d rows, got %d: %v", expected, actual, res)
@@ -133,11 +109,12 @@ func readMysqlCreateFrom(
 		t.Fatal(err)
 	}
 	defer f.Close()
-	tbl, err := readMysqlCreateTable(context.TODO(), f, testEvalCtx, id, expectedParent, name, fks)
+
+	tbl, err := readMysqlCreateTable(context.Background(), f, testEvalCtx, nil, id, expectedParent, name, fks, map[sqlbase.ID]int64{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tbl[0]
+	return tbl[len(tbl)-1]
 }
 
 func TestMysqldumpSchemaReader(t *testing.T) {
@@ -145,11 +122,11 @@ func TestMysqldumpSchemaReader(t *testing.T) {
 
 	files := getMysqldumpTestdata(t)
 
-	simpleTable := descForTable(t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 51, NoFKs)
-	referencedSimple := descForTable(t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 51, NoFKs)
+	simpleTable := descForTable(t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
+	referencedSimple := descForTable(t, readFile(t, `simple.cockroach-schema.sql`), expectedParent, 52, NoFKs)
 	fks := fkHandler{
 		allowed:  true,
-		resolver: fkResolver(map[string]*sqlbase.TableDescriptor{referencedSimple.Name: referencedSimple}),
+		resolver: fkResolver(map[string]*sqlbase.MutableTableDescriptor{referencedSimple.Name: sqlbase.NewMutableCreatedTableDescriptor(*referencedSimple)}),
 	}
 
 	t.Run("simple", func(t *testing.T) {
@@ -178,8 +155,8 @@ func TestMysqldumpSchemaReader(t *testing.T) {
 	})
 
 	t.Run("third-in-multi", func(t *testing.T) {
-		skip := fkHandler{allowed: true, skip: true}
-		expected := descForTable(t, readFile(t, `third.cockroach-schema.sql`), expectedParent, 51, skip)
+		skip := fkHandler{allowed: true, skip: true, resolver: make(fkResolver)}
+		expected := descForTable(t, readFile(t, `third.cockroach-schema.sql`), expectedParent, 52, skip)
 		got := readMysqlCreateFrom(t, files.wholeDB, "third", 51, skip)
 		compareTables(t, expected, got)
 	})
@@ -243,6 +220,47 @@ func compareTables(t *testing.T, expected, got *sqlbase.TableDescriptor) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(expectedBytes, gotBytes) {
-		t.Fatalf("expected\n%+v\n, got\n%+v\n", expected, got)
+		t.Fatalf("expected\n%+v\n, got\n%+v\ndiff: %v", expected, got, pretty.Diff(expected, got))
+	}
+}
+
+func TestMysqlValueToDatum(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	date := func(s string) tree.Datum {
+		d, _, err := tree.ParseDDate(nil, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	ts := func(s string) tree.Datum {
+		d, _, err := tree.ParseDTimestamp(nil, s, time.Microsecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	tests := []struct {
+		raw  mysql.Expr
+		typ  *types.T
+		want tree.Datum
+	}{
+		{raw: mysql.NewStrVal([]byte("0000-00-00")), typ: types.Date, want: tree.DNull},
+		{raw: mysql.NewStrVal([]byte("2010-01-01")), typ: types.Date, want: date("2010-01-01")},
+		{raw: mysql.NewStrVal([]byte("0000-00-00 00:00:00")), typ: types.Timestamp, want: tree.DNull},
+		{raw: mysql.NewStrVal([]byte("2010-01-01 00:00:00")), typ: types.Timestamp, want: ts("2010-01-01 00:00:00")},
+	}
+	evalContext := tree.NewTestingEvalContext(nil)
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%v", tc.raw), func(t *testing.T) {
+			got, err := mysqlValueToDatum(tc.raw, tc.typ, evalContext)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sqlbase
 
@@ -24,15 +20,23 @@ import (
 
 func TestKeyAddress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	tenSysCodec := keys.SystemSQLCodec
+	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
 	testCases := []struct {
 		key roachpb.Key
 	}{
-		{MakeNameMetadataKey(0, "BAR")},
-		{MakeNameMetadataKey(1, "BAR")},
-		{MakeNameMetadataKey(1, "foo")},
-		{MakeNameMetadataKey(2, "foo")},
-		{MakeDescMetadataKey(123)},
-		{MakeDescMetadataKey(124)},
+		{MakeDescMetadataKey(tenSysCodec, 123)},
+		{MakeDescMetadataKey(tenSysCodec, 124)},
+		{NewPublicTableKey(0, "BAR").Key(tenSysCodec)},
+		{NewPublicTableKey(1, "BAR").Key(tenSysCodec)},
+		{NewPublicTableKey(1, "foo").Key(tenSysCodec)},
+		{NewPublicTableKey(2, "foo").Key(tenSysCodec)},
+		{MakeDescMetadataKey(ten5Codec, 123)},
+		{MakeDescMetadataKey(ten5Codec, 124)},
+		{NewPublicTableKey(0, "BAR").Key(ten5Codec)},
+		{NewPublicTableKey(1, "BAR").Key(ten5Codec)},
+		{NewPublicTableKey(1, "foo").Key(ten5Codec)},
+		{NewPublicTableKey(2, "foo").Key(ten5Codec)},
 	}
 	var lastKey roachpb.Key
 	for i, test := range testCases {

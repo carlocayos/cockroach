@@ -1,24 +1,20 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package tests
 
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -32,17 +28,17 @@ type CommandFilters struct {
 	filters []struct {
 		id         int
 		idempotent bool
-		filter     storagebase.ReplicaCommandFilter
+		filter     kvserverbase.ReplicaCommandFilter
 	}
 	nextID int
 
 	numFiltersTrackingReplays int
-	replayProtection          storagebase.ReplicaCommandFilter
+	replayProtection          kvserverbase.ReplicaCommandFilter
 }
 
 // RunFilters executes the registered filters, stopping at the first one
 // that returns an error.
-func (c *CommandFilters) RunFilters(args storagebase.FilterArgs) *roachpb.Error {
+func (c *CommandFilters) RunFilters(args kvserverbase.FilterArgs) *roachpb.Error {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -52,7 +48,7 @@ func (c *CommandFilters) RunFilters(args storagebase.FilterArgs) *roachpb.Error 
 	return c.runFiltersInternal(args)
 }
 
-func (c *CommandFilters) runFiltersInternal(args storagebase.FilterArgs) *roachpb.Error {
+func (c *CommandFilters) runFiltersInternal(args kvserverbase.FilterArgs) *roachpb.Error {
 	for _, f := range c.filters {
 		if pErr := f.filter(args); pErr != nil {
 			return pErr
@@ -69,7 +65,7 @@ func (c *CommandFilters) runFiltersInternal(args storagebase.FilterArgs) *roachp
 // Returns a closure that the client must run for doing cleanup when the
 // filter should be deregistered.
 func (c *CommandFilters) AppendFilter(
-	filter storagebase.ReplicaCommandFilter, idempotent bool,
+	filter kvserverbase.ReplicaCommandFilter, idempotent bool,
 ) func() {
 
 	c.Lock()
@@ -79,7 +75,7 @@ func (c *CommandFilters) AppendFilter(
 	c.filters = append(c.filters, struct {
 		id         int
 		idempotent bool
-		filter     storagebase.ReplicaCommandFilter
+		filter     kvserverbase.ReplicaCommandFilter
 	}{id, idempotent, filter})
 
 	if !idempotent {

@@ -37,41 +37,6 @@ CREATE TABLE pg_type (
     typacl STRING[] NULL
 )
 ----
-TABLE pg_type
- ├── oid oid
- ├── typname name not null
- ├── typnamespace oid
- ├── typowner oid
- ├── typlen int
- ├── typbyval bool
- ├── typtype string
- ├── typcategory string
- ├── typispreferred bool
- ├── typisdefined bool
- ├── typdelim string
- ├── typrelid oid
- ├── typelem oid
- ├── typarray oid
- ├── typinput oid
- ├── typoutput oid
- ├── typreceive oid
- ├── typsend oid
- ├── typmodin oid
- ├── typmodout oid
- ├── typanalyze oid
- ├── typalign string
- ├── typstorage string
- ├── typnotnull bool
- ├── typbasetype oid
- ├── typtypmod int
- ├── typndims int
- ├── typcollation oid
- ├── typdefaultbin string
- ├── typdefault string
- ├── typacl string[]
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 exec-ddl
 CREATE TABLE pg_namespace (
@@ -81,14 +46,6 @@ CREATE TABLE pg_namespace (
     nspacl STRING[] NULL
 )
 ----
-TABLE pg_namespace
- ├── oid oid
- ├── nspname name not null
- ├── nspowner oid
- ├── nspacl string[]
- ├── rowid int not null (hidden)
- └── INDEX primary
-      └── rowid int not null (hidden)
 
 opt
 SELECT
@@ -124,46 +81,57 @@ WHERE
     t.typnamespace = n.oid AND n.nspname != 'pg_catalog';
 ----
 project
- ├── columns: type_cat:38(unknown) type_schem:34(name!null) type_name:2(name!null) class_name:38(unknown) data_type:39(string) remarks:40(string) base_type:74(string)
- ├── fd: ()-->(38)
- ├── left-join-apply
- │    ├── columns: pg_type.oid:1(oid) pg_type.typname:2(name!null) pg_type.typnamespace:3(oid!null) pg_type.typtype:7(string) pg_type.typbasetype:25(oid) pg_namespace.oid:33(oid!null) nspname:34(name!null) case:73(string)
- │    ├── fd: (3)==(33), (33)==(3)
- │    ├── inner-join
- │    │    ├── columns: pg_type.oid:1(oid) pg_type.typname:2(name!null) pg_type.typnamespace:3(oid!null) pg_type.typtype:7(string) pg_type.typbasetype:25(oid) pg_namespace.oid:33(oid!null) nspname:34(name!null)
- │    │    ├── fd: (3)==(33), (33)==(3)
- │    │    ├── scan pg_type
- │    │    │    └── columns: pg_type.oid:1(oid) pg_type.typname:2(name!null) pg_type.typnamespace:3(oid) pg_type.typtype:7(string) pg_type.typbasetype:25(oid)
- │    │    ├── select
- │    │    │    ├── columns: pg_namespace.oid:33(oid) nspname:34(name!null)
- │    │    │    ├── scan pg_namespace
- │    │    │    │    └── columns: pg_namespace.oid:33(oid) nspname:34(name!null)
- │    │    │    └── filters [type=bool, outer=(34), constraints=(/34: (/NULL - /'pg_catalog') [/e'pg_catalog\x00' - ]; tight)]
- │    │    │         └── pg_namespace.nspname != 'pg_catalog' [type=bool, outer=(34), constraints=(/34: (/NULL - /'pg_catalog') [/e'pg_catalog\x00' - ]; tight)]
- │    │    └── filters [type=bool, outer=(3,33), constraints=(/3: (/NULL - ]; /33: (/NULL - ]), fd=(3)==(33), (33)==(3)]
- │    │         └── pg_type.typnamespace = pg_namespace.oid [type=bool, outer=(3,33), constraints=(/3: (/NULL - ]; /33: (/NULL - ])]
- │    ├── max1-row
- │    │    ├── columns: case:73(string)
- │    │    ├── outer: (25)
- │    │    ├── cardinality: [0 - 1]
- │    │    ├── key: ()
- │    │    ├── fd: ()-->(73)
- │    │    └── project
- │    │         ├── columns: case:73(string)
- │    │         ├── outer: (25)
- │    │         ├── select
- │    │         │    ├── columns: pg_type.oid:41(oid!null) pg_type.typname:42(name!null)
- │    │         │    ├── outer: (25)
- │    │         │    ├── fd: ()-->(41)
- │    │         │    ├── scan pg_type
- │    │         │    │    └── columns: pg_type.oid:41(oid) pg_type.typname:42(name!null)
- │    │         │    └── filters [type=bool, outer=(25,41), constraints=(/25: (/NULL - ]; /41: (/NULL - ]), fd=(25)==(41), (41)==(25)]
- │    │         │         └── pg_type.oid = pg_type.typbasetype [type=bool, outer=(25,41), constraints=(/25: (/NULL - ]; /41: (/NULL - ])]
- │    │         └── projections [outer=(42)]
- │    │              └── CASE WHEN pg_type.typname = 'pgType' THEN 'sqlType' ELSE 'OTHER' END [type=string, outer=(42)]
- │    └── true [type=bool]
- └── projections [outer=(1,2,7,34,73)]
-      ├── null [type=unknown]
-      ├── CASE WHEN pg_type.typtype = 'c' THEN 'STRUCT' ELSE 'DISTINCT' END [type=string, outer=(7)]
-      ├── obj_description(pg_type.oid, 'pg_type') [type=string, outer=(1)]
-      └── CASE WHEN pg_type.typtype = 'd' THEN case END [type=string, outer=(7,73)]
+ ├── columns: type_cat:71 type_schem:34!null type_name:2!null class_name:71 data_type:72 remarks:73 base_type:74
+ ├── stable
+ ├── fd: ()-->(71)
+ ├── ensure-distinct-on
+ │    ├── columns: t.oid:1 t.typname:2!null t.typtype:7 nspname:34!null case:70 rownum:75!null
+ │    ├── grouping columns: rownum:75!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── key: (75)
+ │    ├── fd: (75)-->(1,2,7,34,70)
+ │    ├── left-join (hash)
+ │    │    ├── columns: t.oid:1 t.typname:2!null t.typnamespace:3!null t.typtype:7 t.typbasetype:25 n.oid:33!null nspname:34!null pg_type.oid:38 case:70 rownum:75!null
+ │    │    ├── multiplicity: left-rows(one-or-more), right-rows(zero-or-more)
+ │    │    ├── fd: (3)==(33), (33)==(3), (75)-->(1-3,7,25,33,34)
+ │    │    ├── ordinality
+ │    │    │    ├── columns: t.oid:1 t.typname:2!null t.typnamespace:3!null t.typtype:7 t.typbasetype:25 n.oid:33!null nspname:34!null rownum:75!null
+ │    │    │    ├── key: (75)
+ │    │    │    ├── fd: (3)==(33), (33)==(3), (75)-->(1-3,7,25,33,34)
+ │    │    │    └── inner-join (hash)
+ │    │    │         ├── columns: t.oid:1 t.typname:2!null t.typnamespace:3!null t.typtype:7 t.typbasetype:25 n.oid:33!null nspname:34!null
+ │    │    │         ├── fd: (3)==(33), (33)==(3)
+ │    │    │         ├── scan t
+ │    │    │         │    └── columns: t.oid:1 t.typname:2!null t.typnamespace:3 t.typtype:7 t.typbasetype:25
+ │    │    │         ├── select
+ │    │    │         │    ├── columns: n.oid:33 nspname:34!null
+ │    │    │         │    ├── scan n
+ │    │    │         │    │    └── columns: n.oid:33 nspname:34!null
+ │    │    │         │    └── filters
+ │    │    │         │         └── nspname:34 != 'pg_catalog' [outer=(34), constraints=(/34: (/NULL - /'pg_catalog') [/e'pg_catalog\x00' - ]; tight)]
+ │    │    │         └── filters
+ │    │    │              └── t.typnamespace:3 = n.oid:33 [outer=(3,33), constraints=(/3: (/NULL - ]; /33: (/NULL - ]), fd=(3)==(33), (33)==(3)]
+ │    │    ├── project
+ │    │    │    ├── columns: case:70!null pg_type.oid:38
+ │    │    │    ├── scan pg_type
+ │    │    │    │    └── columns: pg_type.oid:38 pg_type.typname:39!null
+ │    │    │    └── projections
+ │    │    │         └── CASE WHEN pg_type.typname:39 = 'pgType' THEN 'sqlType' ELSE 'OTHER' END [as=case:70, outer=(39)]
+ │    │    └── filters
+ │    │         └── pg_type.oid:38 = t.typbasetype:25 [outer=(25,38), constraints=(/25: (/NULL - ]; /38: (/NULL - ]), fd=(25)==(38), (38)==(25)]
+ │    └── aggregations
+ │         ├── const-agg [as=t.oid:1, outer=(1)]
+ │         │    └── t.oid:1
+ │         ├── const-agg [as=t.typname:2, outer=(2)]
+ │         │    └── t.typname:2
+ │         ├── const-agg [as=t.typtype:7, outer=(7)]
+ │         │    └── t.typtype:7
+ │         ├── const-agg [as=nspname:34, outer=(34)]
+ │         │    └── nspname:34
+ │         └── const-agg [as=case:70, outer=(70)]
+ │              └── case:70
+ └── projections
+      ├── NULL [as=type_cat:71]
+      ├── CASE WHEN t.typtype:7 = 'c' THEN 'STRUCT' ELSE 'DISTINCT' END [as=data_type:72, outer=(7)]
+      ├── obj_description(t.oid:1, 'pg_type') [as=remarks:73, outer=(1), stable]
+      └── CASE WHEN t.typtype:7 = 'd' THEN case:70 ELSE CAST(NULL AS STRING) END [as=base_type:74, outer=(7,70)]

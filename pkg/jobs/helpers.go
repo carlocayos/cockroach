@@ -1,25 +1,22 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package jobs
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // FakeNodeID is a dummy node ID for use in tests. It always stores 1.
@@ -34,7 +31,7 @@ var FakeNodeID = func() *base.NodeIDContainer {
 type FakeNodeLiveness struct {
 	mu struct {
 		syncutil.Mutex
-		livenessMap map[roachpb.NodeID]*storage.Liveness
+		livenessMap map[roachpb.NodeID]*kvserverpb.Liveness
 	}
 
 	// A non-blocking send is performed over these channels when the corresponding
@@ -49,10 +46,10 @@ func NewFakeNodeLiveness(nodeCount int) *FakeNodeLiveness {
 		SelfCalledCh:          make(chan struct{}),
 		GetLivenessesCalledCh: make(chan struct{}),
 	}
-	nl.mu.livenessMap = make(map[roachpb.NodeID]*storage.Liveness)
+	nl.mu.livenessMap = make(map[roachpb.NodeID]*kvserverpb.Liveness)
 	for i := 0; i < nodeCount; i++ {
 		nodeID := roachpb.NodeID(i + 1)
-		nl.mu.livenessMap[nodeID] = &storage.Liveness{
+		nl.mu.livenessMap[nodeID] = &kvserverpb.Liveness{
 			Epoch:      1,
 			Expiration: hlc.LegacyTimestamp(hlc.MaxTimestamp),
 			NodeID:     nodeID,
@@ -67,19 +64,18 @@ func (*FakeNodeLiveness) ModuleTestingKnobs() {}
 // Self implements the implicit storage.NodeLiveness interface. It uses NodeID
 // as the node ID. On every call, a nonblocking send is performed over nl.ch to
 // allow tests to execute a callback.
-func (nl *FakeNodeLiveness) Self() (*storage.Liveness, error) {
+func (nl *FakeNodeLiveness) Self() (kvserverpb.Liveness, error) {
 	select {
 	case nl.SelfCalledCh <- struct{}{}:
 	default:
 	}
 	nl.mu.Lock()
 	defer nl.mu.Unlock()
-	selfCopy := *nl.mu.livenessMap[FakeNodeID.Get()]
-	return &selfCopy, nil
+	return *nl.mu.livenessMap[FakeNodeID.Get()], nil
 }
 
 // GetLivenesses implements the implicit storage.NodeLiveness interface.
-func (nl *FakeNodeLiveness) GetLivenesses() (out []storage.Liveness) {
+func (nl *FakeNodeLiveness) GetLivenesses() (out []kvserverpb.Liveness) {
 	select {
 	case nl.GetLivenessesCalledCh <- struct{}{}:
 	default:
@@ -90,6 +86,11 @@ func (nl *FakeNodeLiveness) GetLivenesses() (out []storage.Liveness) {
 		out = append(out, *liveness)
 	}
 	return out
+}
+
+// IsLive is unimplemented.
+func (nl *FakeNodeLiveness) IsLive(roachpb.NodeID) (bool, error) {
+	return false, errors.New("FakeNodeLiveness.IsLive is unimplemented")
 }
 
 // FakeIncrementEpoch increments the epoch for the node with the specified ID.

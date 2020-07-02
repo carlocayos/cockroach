@@ -1,4 +1,4 @@
-# LogicTest: local local-opt
+# LogicTest: local
 
 statement ok
 CREATE DATABASE a
@@ -9,7 +9,7 @@ CREATE DATABASE a
 statement ok
 CREATE DATABASE IF NOT EXISTS a
 
-statement error empty database name
+statement error pgcode 42601 empty database name
 CREATE DATABASE ""
 
 query T colnames
@@ -22,6 +22,19 @@ postgres
 system
 test
 
+statement ok
+COMMENT ON DATABASE a IS 'A'
+
+query TT colnames
+SHOW DATABASES WITH COMMENT
+----
+database_name  comment
+a              A
+defaultdb      NULL
+postgres       NULL
+system         NULL
+test           NULL
+
 query T colnames
 SHOW SCHEMAS FROM a
 ----
@@ -29,6 +42,7 @@ schema_name
 crdb_internal
 information_schema
 pg_catalog
+pg_extension
 public
 
 statement ok
@@ -127,7 +141,7 @@ DROP DATABASE b2 CASCADE;
   DROP DATABASE b5 CASCADE;
   DROP DATABASE b6 CASCADE
 
-statement error empty database name
+statement error pgcode 42601 empty database name
 DROP DATABASE ""
 
 query T colnames
@@ -156,7 +170,7 @@ SELECT * FROM b.a
 
 user testuser
 
-statement error only superusers are allowed to CREATE DATABASE
+statement error only users with the admin role are allowed to CREATE DATABASE
 CREATE DATABASE privs
 
 user root

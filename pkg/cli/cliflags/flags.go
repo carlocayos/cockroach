@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package cliflags
 
@@ -131,20 +127,6 @@ Including more tiers is better than including fewer. For example:
   --locality=planet=earth,province=manitoba,colo=secondary,power=3`,
 	}
 
-	ZoneConfig = FlagInfo{
-		Name:      "file",
-		Shorthand: "f",
-		Description: `
-File to read the zone configuration from. Specify "-" to read from standard input.`,
-	}
-
-	ZoneDisableReplication = FlagInfo{
-		Name: "disable-replication",
-		Description: `
-Disable replication in the zone by setting the desired replica count to 1.
-Equivalent to setting 'num_replicas: 1' via -f.`,
-	}
-
 	Background = FlagInfo{
 		Name: "background",
 		Description: `
@@ -161,7 +143,7 @@ Maximum memory capacity available to store temporary data for SQL clients,
 including prepared queries and intermediate data rows during query execution.
 Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
 percentage of physical memory (e.g. .25).
-If left unspecified, defaults to 128MiB.
+If left unspecified, defaults to 25% of physical memory.
 `,
 	}
 
@@ -196,6 +178,19 @@ when the first store is in-memory.
 `,
 	}
 
+	AuthTokenValidityPeriod = FlagInfo{
+		Name: "expire-after",
+		Description: `
+Duration after which the newly created session token expires.`,
+	}
+
+	OnlyCookie = FlagInfo{
+		Name: "only-cookie",
+		Description: `
+Display only the newly created cookie on the standard output
+without additional details and decoration.`,
+	}
+
 	Cache = FlagInfo{
 		Name: "cache",
 		Description: `
@@ -206,16 +201,22 @@ can also be specified (e.g. .25).`,
 	}
 
 	ClientHost = FlagInfo{
-		Name:        "host",
-		EnvVar:      "COCKROACH_HOST",
-		Description: `Database server host to connect to.`,
+		Name:   "host",
+		EnvVar: "COCKROACH_HOST",
+		Description: `
+CockroachDB node to connect to.
+This can be specified either as an address/hostname, or
+together with a port number as in -s myhost:26257.
+If the port number is left unspecified, it defaults to 26257.
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.`,
 	}
 
 	ClientPort = FlagInfo{
 		Name:        "port",
 		Shorthand:   "p",
 		EnvVar:      "COCKROACH_PORT",
-		Description: `Database server port to connect to.`,
+		Description: `Deprecated. Use --host=<host>:<port>.`,
 	}
 
 	Database = FlagInfo{
@@ -239,6 +240,12 @@ Dumps the data as of the specified timestamp. Formats supported are the same
 as the timestamp type.`,
 	}
 
+	DumpAll = FlagInfo{
+		Name: "dump-all",
+		Description: `
+Dumps all databases, for each non-system database provides dump of all available tables.`,
+	}
+
 	Execute = FlagInfo{
 		Name:      "execute",
 		Shorthand: "e",
@@ -250,10 +257,28 @@ with a non-zero status code and further statements are not executed. The
 results of each SQL statement are printed on the standard output.`,
 	}
 
+	Watch = FlagInfo{
+		Name: "watch",
+		Description: `
+Repeat the SQL statement(s) specified with --execute
+with the specified period. The client will stop watching
+if an execution of the SQL statement(s) fail.`,
+	}
+
 	EchoSQL = FlagInfo{
 		Name: "echo-sql",
 		Description: `
 Reveal the SQL statements sent implicitly by the command-line utility.`,
+	}
+
+	CliDebugMode = FlagInfo{
+		Name: "debug-sql-cli",
+		Description: `
+Simplify the SQL CLI to ease troubleshooting of CockroachDB
+issues. This echoes sent SQL, removes the database name and txn status
+from the prompt, and forces behavior to become independent on current
+transaction state. Equivalent to --echo-sql, \unset check_syntax and
+\set prompt1 %n@%M>.`,
 	}
 
 	SafeUpdates = FlagInfo{
@@ -267,8 +292,7 @@ sql_safe_updates = FALSE.`,
 	}
 
 	Set = FlagInfo{
-		Name:      "set",
-		Shorthand: "s",
+		Name: "set",
 		Description: `
 Set a client-side configuration parameter before running the SQL
 shell. This flag may be specified multiple times.`,
@@ -278,9 +302,36 @@ shell. This flag may be specified multiple times.`,
 		Name: "format",
 		Description: `
 Selects how to display table rows in results. Possible values: tsv,
-csv, pretty, records, sql, raw, html. If left unspecified, defaults to
-tsv for non-interactive sessions and pretty for interactive
-sessions.`,
+csv, table, records, sql, raw, html. If left unspecified, defaults to
+tsv for non-interactive sessions and table for interactive sessions.`,
+	}
+
+	ClusterName = FlagInfo{
+		Name: "cluster-name",
+		Description: `
+Sets a name to verify the identity of a remote node or cluster. The
+value must match between this node and the remote node(s) specified
+via --join.
+
+This can be used as an additional verification when either the node or
+cluster, or both, have not yet been initialized and do not yet know
+their cluster ID.
+
+To introduce a cluster name into an already-initialized cluster, pair
+this flag with --disable-cluster-name-verification.`,
+	}
+
+	DisableClusterNameVerification = FlagInfo{
+		Name: "disable-cluster-name-verification",
+		Description: `
+Tell the server to ignore cluster name mismatches. This is meant for
+use when opting an existing cluster into starting to use cluster name
+verification, or when changing the cluster name.
+
+The cluster should be restarted once with --cluster-name and
+--disable-cluster-name-verification combined, and once all nodes have
+been updated to know the new cluster name, the cluster can be
+restarted again with this flag removed.`,
 	}
 
 	Join = FlagInfo{
@@ -324,12 +375,39 @@ or both forms can be used together, for example:
 </PRE>`,
 	}
 
+	JoinPreferSRVRecords = FlagInfo{
+		Name: "experimental-dns-srv",
+		Description: `
+When enabled, the node will first attempt to fetch SRV records
+from DNS for every name specified with --join. If a valid
+SRV record is found, that information is used instead
+of regular DNS A/AAAA lookups.
+This feature is experimental and may be removed or modified
+in a later version.`,
+	}
+
 	ListenAddr = FlagInfo{
 		Name: "listen-addr",
 		Description: `
-The address or hostname to listen on. An IPv6 address can also be
-specified with the notation [...], for example [::1] or
-[fe80::f6f2:::].
+The address/hostname and port to listen on for intra-cluster
+communication, for example --listen-addr=myhost:26257 or
+--listen-addr=:26257 (listen on all interfaces).
+Unless --sql-addr is also specified, this address is also
+used to accept SQL client connections.
+<PRE>
+
+</PRE>
+If the address part is left unspecified, it defaults to
+the "all interfaces" address (0.0.0.0 IPv4 / [::] IPv6).
+If the port part is left unspecified, it defaults to 26257.
+<PRE>
+
+</PRE>
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.
+<PRE>
+
+</PRE>
 If --advertise-addr is left unspecified, the node will also announce
 this address for use by other nodes. It is strongly recommended to use
 --advertise-addr in cloud and container deployments or any setup where
@@ -341,16 +419,6 @@ NAT is present between cluster nodes.`,
 		Description: `Alias for --listen-addr. Deprecated.`,
 	}
 
-	ListenPort = FlagInfo{
-		Name:      "listen-port",
-		Shorthand: "p",
-		Description: `
-The port to bind to.
-If --advertise-port is left unspecified, the node will also announce
-this port for use by other nodes. If a router implements NAT or N:M
-port forwarding, be sure to also use --advertise-port.`,
-	}
-
 	ServerPort = FlagInfo{
 		Name:        "port",
 		Description: `Alias for --listen-port. Deprecated.`,
@@ -359,10 +427,51 @@ port forwarding, be sure to also use --advertise-port.`,
 	AdvertiseAddr = FlagInfo{
 		Name: "advertise-addr",
 		Description: `
-The address or hostname to advertise to other CockroachDB nodes for intra-cluster
-communication; it must resolve and be routable from other nodes in the cluster.
+The address/hostname and port to advertise to other CockroachDB nodes
+for intra-cluster communication. It must resolve and be routable from
+other nodes in the cluster.
+<PRE>
+
+</PRE>
+If left unspecified, it defaults to the setting of --listen-addr.
+If the flag is provided but either the address part or the port part
+is left unspecified, that particular part defaults to the
+same part in --listen-addr.
+<PRE>
+
+</PRE>
 An IPv6 address can also be specified with the notation [...], for
-example [::1] or [fe80::f6f2:::].`,
+example [::1]:26257 or [fe80::f6f2:::]:26257.
+<PRE>
+
+</PRE>
+The port number should be the same as in --listen-addr unless port
+forwarding is set up on an intermediate firewall/router.`,
+	}
+
+	SQLAdvertiseAddr = FlagInfo{
+		Name: "advertise-sql-addr",
+		Description: `
+The SQL address/hostname and port to advertise to CLI admin utilities
+and via SQL introspection for the purpose of SQL address discovery.
+It must resolve and be routable from clients.
+<PRE>
+
+</PRE>
+If left unspecified, it defaults to the setting of --sql-addr.
+If the flag is provided but either the address part or the port part
+is left unspecified, that particular part defaults to the
+same part in --sql-addr.
+<PRE>
+
+</PRE>
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.
+<PRE>
+
+</PRE>
+The port number should be the same as in --sql-addr unless port
+forwarding is set up on an intermediate firewall/router.`,
 	}
 
 	AdvertiseHost = FlagInfo{
@@ -371,16 +480,70 @@ example [::1] or [fe80::f6f2:::].`,
 	}
 
 	AdvertisePort = FlagInfo{
-		Name: "advertise-port",
+		Name:        "advertise-port",
+		Description: `Deprecated. Use --advertise-addr=<host>:<port>.`,
+	}
+
+	ListenSQLAddr = FlagInfo{
+		Name: "sql-addr",
 		Description: `
-The port to advertise to other CockroachDB nodes for intra-cluster
-communication. This should not be set differently from --listen-port
-unless port forwarding is set up on an intermediate firewall/router.`,
+The hostname or IP address to bind to for SQL clients, for example
+--sql-addr=myhost:26257 or --sql-addr=:26257 (listen on all interfaces).
+If left unspecified, the address specified by --listen-addr will be
+used for both RPC and SQL connections.
+<PRE>
+
+</PRE>
+If specified but the address part is omitted, the address part
+defaults to the address part of --listen-addr.
+If specified but the port number is omitted, the port
+number defaults to 26257.
+<PRE>
+
+</PRE>
+To actually use separate bindings, it is recommended to specify
+both flags and use a different port number via --listen-addr, for
+example --sql-addr=:26257 --listen-addr=:26258. Ensure that
+--join is set accordingly on other nodes. It is also possible
+to use the same port number but separate host addresses.
+<PRE>
+
+</PRE>
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.`,
 	}
 
 	ListenHTTPAddr = FlagInfo{
-		Name:        "http-addr",
-		Description: `The hostname or IP address to bind to for HTTP requests.`,
+		Name: "http-addr",
+		Description: `
+The hostname or IP address to bind to for HTTP requests.
+If left unspecified, the address part defaults to the setting of
+--listen-addr. The port number defaults to 8080.
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:8080 or [fe80::f6f2:::]:8080.`,
+	}
+
+	UnencryptedLocalhostHTTP = FlagInfo{
+		Name: "unencrypted-localhost-http",
+		Description: `
+When specified, restricts HTTP connections to localhost-only and disables
+TLS for the HTTP interface. The hostname part of --http-addr, if specified,
+is then ignored. This flag is intended for use to facilitate
+local testing without requiring certificate setups in web browsers.`,
+	}
+
+	LocalityAdvertiseAddr = FlagInfo{
+		Name: "locality-advertise-addr",
+		Description: `
+List of ports to advertise to other CockroachDB nodes for intra-cluster
+communication for some locality. This should be specified as a commma
+separated list of locality@address. Addresses can also include ports.
+For example:
+<PRE>
+"region=us-west@127.0.0.1,datacenter=us-west-1b@127.0.0.1"
+"region=us-west@127.0.0.1:26257,datacenter=us-west-1b@127.0.0.1:26258"
+</PRE>
+`,
 	}
 
 	ListenHTTPAddrAlias = FlagInfo{
@@ -390,7 +553,7 @@ unless port forwarding is set up on an intermediate firewall/router.`,
 
 	ListenHTTPPort = FlagInfo{
 		Name:        "http-port",
-		Description: `The port to bind to for HTTP requests.`,
+		Description: `Deprecated. Use --http-addr=<host>:<port>.`,
 	}
 
 	ListeningURLFile = FlagInfo{
@@ -408,12 +571,27 @@ write its process ID to the specified file.`,
 	}
 
 	Socket = FlagInfo{
-		Name:   "socket",
-		EnvVar: "COCKROACH_SOCKET",
+		Name:        "socket",
+		EnvVar:      "COCKROACH_SOCKET",
+		Description: `Deprecated in favor of --socket-dir.`,
+	}
+
+	SocketDir = FlagInfo{
+		Name:   "socket-dir",
+		EnvVar: "COCKROACH_SOCKET_DIR",
 		Description: `
-Unix socket file, postgresql protocol only.
-Note: when given a path to a unix socket, most postgres clients will
-open "<given path>/.s.PGSQL.<server port>"`,
+Accept client connections using a Unix domain socket created
+in the specified directory.
+
+Note: for compatibility with PostgreSQL clients and drivers,
+the generated socket name has the form "/path/to/.s.PGSQL.NNNN",
+where NNNN is the port number configured via --listen-addr.
+
+PostgreSQL clients only take a port number and directory as input
+and construct the socket name programmatically.
+
+To use, for example: psql -h /path/to -p NNNN ...
+`,
 	}
 
 	ClientInsecure = FlagInfo{
@@ -432,6 +610,18 @@ listening on all IP addresses (unless --listen-addr is provided) and
 disabling password authentication for all database users. This is
 strongly discouraged for production usage and should never be used on
 a public network without combining it with --listen-addr.`,
+	}
+
+	ExternalIODisableHTTP = FlagInfo{
+		Name:        "external-io-disable-http",
+		Description: `Disable use of HTTP when accessing external data.`,
+	}
+
+	ExternalIODisableImplicitCredentials = FlagInfo{
+		Name: "external-io-disable-implicit-credentials",
+		Description: `
+Disable use of implicit credentials when accessing external data.
+Instead, require the user to always specify access keys.`,
 	}
 
 	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
@@ -456,30 +646,20 @@ a public network without combining it with --listen-addr.`,
 		Description: `Certificate and key files are overwritten if they exist.`,
 	}
 
+	GeneratePKCS8Key = FlagInfo{
+		Name:        "also-generate-pkcs8-key",
+		Description: `Also write the key in pkcs8 format to <certs-dir>/client.<username>.key.pk8.`,
+	}
+
 	Password = FlagInfo{
 		Name:        "password",
 		Description: `Prompt for the new user's password.`,
 	}
 
 	CertsDir = FlagInfo{
-		Name:   "certs-dir",
-		EnvVar: "COCKROACH_CERTS_DIR",
-		Description: `
-The path to the directory containing SSL certificates and keys.
-<PRE>
-
-Cockroach looks for certificates and keys inside the directory using the
-following naming scheme:
-
-  - CA certificate and key: ca.crt, ca.key
-  - Server certificate and key: node.crt, node.key
-  - Client certificate and key: client.<user>.crt, client.<user>.key
-
-When running client commands, the user can be specified with the --user flag.
-</PRE>
-
-Keys have a minimum permission requirement of 0700 (rwx------). This restriction can be
-disabled by setting the environment variable COCKROACH_SKIP_KEY_PERMISSION_CHECK to true.`,
+		Name:        "certs-dir",
+		EnvVar:      "COCKROACH_CERTS_DIR",
+		Description: `Path to the directory containing SSL certificates and keys.`,
 	}
 
 	// Server version of the certs directory flag, cannot be set through environment.
@@ -488,19 +668,43 @@ disabled by setting the environment variable COCKROACH_SKIP_KEY_PERMISSION_CHECK
 		Description: CertsDir.Description,
 	}
 
+	CertPrincipalMap = FlagInfo{
+		Name: "cert-principal-map",
+		Description: `
+A comma separated list of <cert-principal>:<db-principal> mappings. This allows
+mapping the principal in a cert to a DB principal such as "node" or "root" or
+any SQL user. This is intended for use in situations where the certificate
+management system places restrictions on the Subject.CommonName or
+SubjectAlternateName fields in the certificate (e.g. disallowing a CommonName
+such as "node" or "root"). If multiple mappings are provided for the same
+<cert-principal>, the last one specified in the list takes precedence. A
+principal not specified in the map is passed through as-is via the identity
+function. A cert is allowed to authenticate a DB principal if the DB principal
+name is contained in the mapped CommonName or DNS-type SubjectAlternateName
+fields.
+`,
+	}
+
 	CAKey = FlagInfo{
 		Name:        "ca-key",
 		EnvVar:      "COCKROACH_CA_KEY",
 		Description: `Path to the CA key.`,
 	}
 
-	// TODO(tschottdorf): once clockless mode becomes non-experimental, explain it here:
-	// <PRE>
-	//
-	// </PRE>
-	// Specifying the string value 'experimental-clockless' instead of a duration runs the cluster
-	// in clockless reads mode. In that mode, reads are routed through Raft and subsequently
-	// performance is reduced, but clock synchronization is not relied upon for correctness.
+	ClockDevice = FlagInfo{
+		Name: "clock-device",
+		Description: `
+Override HLC to use PTP hardware clock user space API when querying for current time.
+The value corresponds to the clock device to be used. This is currently only tested
+and supported on Linux.
+<PRE>
+
+  --clock-device=/dev/ptp0
+
+</PRE>
+`,
+	}
+
 	MaxOffset = FlagInfo{
 		Name: "max-offset",
 		Description: `
@@ -579,12 +783,24 @@ Also, if you use equal signs in the file path to a store, you must use the
 "path" field label.`,
 	}
 
+	StorageEngine = FlagInfo{
+		Name: "storage-engine",
+		Description: `
+Storage engine to use for all stores on this cockroach node. Options are default,
+rocksdb, or pebble.
+
+If default is specified, the storage engine last used to write to the first
+store directory is used (see --store). If the store directory is uninitialized
+and default is specified, rocksdb is used as the default storage engine.`,
+	}
+
 	Size = FlagInfo{
 		Name:      "size",
 		Shorthand: "z",
 		Description: `
 The Size to fill Store upto(using a ballast file):
 Negative value means denotes amount of space that should be left after filling the disk.
+If the Size is left unspecified, it defaults to 1GB.
 <PRE>
 
   --size=20GiB
@@ -643,9 +859,9 @@ The value "disabled" will disable all local file I/O. `,
 		Name:   "url",
 		EnvVar: "COCKROACH_URL",
 		Description: `
-Connection url. eg: postgresql://myuser@localhost:26257/mydb
+Connection URL, e.g. "postgresql://myuser@localhost:26257/mydb".
 If left empty, the connection flags are used (host, port, user,
-database, insecure, certs).`,
+database, insecure, certs-dir).`,
 	}
 
 	User = FlagInfo{
@@ -658,17 +874,22 @@ database, insecure, certs).`,
 	From = FlagInfo{
 		Name: "from",
 		Description: `
-Start key and format as [<format>:]<key>. Supported formats: raw, human,
+Start key and format as [<format>:]<key>. Supported formats: raw, hex, human,
 rangeID. The raw format supports escaped text. For example, "raw:\x01k" is the
-prefix for range local keys.`,
+prefix for range local keys. The hex format takes an encoded MVCCKey.`,
 	}
 
 	To = FlagInfo{
 		Name: "to",
 		Description: `
-Exclusive end key and format as [<format>:]<key>. Supported formats: raw,
+Exclusive end key and format as [<format>:]<key>. Supported formats: raw, hex,
 human, rangeID. The raw format supports escaped text. For example, "raw:\x01k"
-is the prefix for range local keys.`}
+is the prefix for range local keys. The hex format takes an encoded MVCCKey.`}
+
+	Limit = FlagInfo{
+		Name:        "limit",
+		Description: `Maximum number of keys to return.`,
+	}
 
 	Values = FlagInfo{
 		Name:        "values",
@@ -700,11 +921,11 @@ If specified, print the system config contents. Beware that the output will be
 long and not particularly human-readable.`,
 	}
 
-	Decommission = FlagInfo{
-		Name: "decommission",
+	DrainWait = FlagInfo{
+		Name: "drain-wait",
 		Description: `
-If specified, decommissions the node and waits for it to rebalance before
-shutting down the node.`,
+When non-zero, wait for the specified amount of time for the node to
+drain all active client connections and migrate away range leases.`,
 	}
 
 	Wait = FlagInfo{
@@ -751,9 +972,16 @@ When no node ID is specified, also lists all nodes that have been decommissioned
 in the history of the cluster.`,
 	}
 
+	NodeDecommissionSelf = FlagInfo{
+		Name: "self",
+		Description: `Use the node ID of the node connected to via --host
+as target of the decommissioning or recommissioning command.`,
+	}
+
 	SQLFmtLen = FlagInfo{
-		Name:        "print-width",
-		Description: `The line length where sqlfmt will try to wrap.`,
+		Name: "print-width",
+		Description: `
+The line length where sqlfmt will try to wrap.`,
 	}
 
 	SQLFmtSpaces = FlagInfo{
@@ -774,5 +1002,190 @@ in the history of the cluster.`,
 	SQLFmtAlign = FlagInfo{
 		Name:        "align",
 		Description: `Align the output.`,
+	}
+
+	DemoNodes = FlagInfo{
+		Name:        "nodes",
+		Description: `How many in-memory nodes to create for the demo.`,
+	}
+
+	DemoNodeSQLMemSize = FlagInfo{
+		Name: "max-sql-memory",
+		Description: `
+Maximum memory capacity available for each node to store temporary data for SQL clients,
+including prepared queries and intermediate data rows during query execution.
+Accepts numbers interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
+percentage of physical memory (e.g. .25).
+If left unspecified, defaults to 128MiB.
+`,
+	}
+	DemoNodeCacheSize = FlagInfo{
+		Name: "cache",
+		Description: `
+Total size in bytes for caches per node, shared evenly if there are multiple
+storage devices. Size suffixes are supported (e.g. 1GB and 1GiB).
+If left unspecified, defaults to 64MiB. A percentage of physical memory
+can also be specified (e.g. .25).`,
+	}
+
+	RunDemoWorkload = FlagInfo{
+		Name:        "with-load",
+		Description: `Run a demo workload against the pre-loaded database.`,
+	}
+
+	DemoNodeLocality = FlagInfo{
+		Name: "demo-locality",
+		Description: `
+Locality information for each demo node. The input is a colon separated
+list of localities for each node. The i'th locality in the colon separated
+list sets the locality for the i'th demo cockroach node. For example:
+<PRE>
+
+--demo-locality=region=us-east1,az=1:region=us-east1,az=2:region=us-east1,az=3
+
+Assigns node1's region to us-east1 and availability zone to 1, node 2's
+region to us-east1 and availability zone to 2, and node 3's region
+to us-east1 and availability zone to 3.
+`,
+	}
+
+	DemoGeoPartitionedReplicas = FlagInfo{
+		Name: "geo-partitioned-replicas",
+		Description: `
+When used with the Movr dataset, create a 9 node cluster and automatically apply
+the geo-partitioned replicas topology across 3 virtual regions named us-east1, us-west1, and
+europe-west1. This command will fail with an error if an enterprise license could not
+be acquired, or if the Movr dataset is not used. More information about the geo-partitioned 
+replicas topology can be found at this URL: 
+https://www.cockroachlabs.com/docs/v19.1/topology-geo-partitioned-replicas.html
+		`,
+	}
+
+	DemoNoLicense = FlagInfo{
+		Name: "disable-demo-license",
+		Description: `
+If set, disable cockroach demo from attempting to obtain a temporary license.`,
+	}
+
+	UseEmptyDatabase = FlagInfo{
+		Name: "empty",
+		Description: `
+Start with an empty database: avoid pre-loading a default dataset in
+the demo shell.`,
+	}
+
+	GeoLibsDir = FlagInfo{
+		Name: "geo-libs",
+		Description: `
+The location where all libraries for Geospatial operations is located.`,
+	}
+
+	Global = FlagInfo{
+		Name: "global",
+		Description: `
+Simulate a global cluster. This adds artificial latencies to nodes in different
+regions. This flag only works with the default node localities. This setting is experimental.`,
+	}
+
+	LogDir = FlagInfo{
+		Name: "log-dir",
+		Description: `
+If non-empty, write log files in this directory. If empty, write log files to
+<store-dir>/logs where <store-dir> is the directory of the first on disk store.
+`,
+	}
+
+	LogDirMaxSize = FlagInfo{
+		Name: "log-group-max-size",
+		Description: `
+Maximum combined size of all log files in a logging group.
+`,
+	}
+
+	LogFileMaxSize = FlagInfo{
+		Name: "log-file-max-size",
+		Description: `
+Maximum size of each log file.
+`,
+	}
+
+	LogFileVerbosity = FlagInfo{
+		Name: "log-file-verbosity",
+		Description: `
+Minimum verbosity of messages written to the log file.
+`,
+	}
+
+	WriteSize = FlagInfo{
+		Name: "write-size",
+		Description: `
+Size of blocks to write to storage device.`,
+	}
+
+	SyncInterval = FlagInfo{
+		Name: "sync-interval",
+		Description: `
+Number of bytes to write before running fsync.`,
+	}
+
+	BenchConcurrency = FlagInfo{
+		Name: "concurrency",
+		Description: `
+Number of workers for benchmarking.`,
+	}
+
+	BenchDuration = FlagInfo{
+		Name: "duration",
+		Description: `
+Amount of time to run workers.`,
+	}
+
+	BenchServer = FlagInfo{
+		Name: "server",
+		Description: `
+Run as server for network benchmark.`,
+	}
+
+	BenchPort = FlagInfo{
+		Name: "port",
+		Description: `
+Port for network benchmark.`,
+	}
+
+	BenchAddresses = FlagInfo{
+		Name: "addresses",
+		Description: `
+Addresses for network benchmark.`,
+	}
+	BenchLatency = FlagInfo{
+		Name: "latency",
+		Description: `
+Latency or throughput mode.`,
+	}
+
+	ZipNodes = FlagInfo{
+		Name: "nodes",
+		Description: `
+List of nodes to include. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to include all nodes.`,
+	}
+
+	ZipExcludeNodes = FlagInfo{
+		Name: "exclude-nodes",
+		Description: `
+List of nodes to exclude. Can be specified as a comma-delimited
+list of node IDs or ranges of node IDs, for example: 5,10-20,23.
+The default is to not exclude any node.`,
+	}
+
+	ZipRedactLogs = FlagInfo{
+		Name: "redact-logs",
+		Description: `
+Redact text that may contain confidential data or PII from retrieved
+log entries. Note that this flag only operates on log entries;
+other items retrieved by the zip command may still consider
+confidential data or PII.
+`,
 	}
 )

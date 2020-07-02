@@ -16,15 +16,17 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/sampledataccl"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/cloudimpl"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 )
@@ -53,10 +55,8 @@ func BenchmarkAddSSTable(b *testing.B) {
 			b.StopTimer()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				sst, err := engine.MakeRocksDBSstFileWriter()
-				if err != nil {
-					b.Fatalf("%+v", err)
-				}
+				sstFile := &storage.MemFile{}
+				sst := storage.MakeBackupSSTWriter(sstFile)
 
 				id++
 				backup.ResetKeyValueIteration()
@@ -65,19 +65,21 @@ func BenchmarkAddSSTable(b *testing.B) {
 					b.Fatalf("%+v", err)
 				}
 				for _, kv := range kvs {
-					if err := sst.Add(kv); err != nil {
+					if err := sst.Put(kv.Key, kv.Value); err != nil {
 						b.Fatalf("%+v", err)
 					}
 				}
-				data, err := sst.Finish()
-				if err != nil {
+				if err := sst.Finish(); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				sst.Close()
+				data := sstFile.Data()
 				totalLen += int64(len(data))
 
 				b.StartTimer()
-				if err := kvDB.AddSSTable(ctx, span.Key, span.EndKey, data); err != nil {
+				if err := kvDB.AddSSTable(
+					ctx, span.Key, span.EndKey, data, false /* disallowShadowing */, nil /* stats */, false, /* ingestAsWrites */
+				); err != nil {
 					b.Fatalf("%+v", err)
 				}
 				b.StopTimer()
@@ -106,7 +108,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 			kvDB := tc.Server(0).DB()
 
 			id := sqlbase.ID(keys.MinUserDescID)
-			var batch engine.RocksDBBatchBuilder
+			var batch storage.RocksDBBatchBuilder
 
 			var totalLen int64
 			b.StopTimer()
@@ -151,7 +153,8 @@ func BenchmarkImport(b *testing.B) {
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
-			storage, err := storageccl.ExportStorageConfFromURI(`nodelocal:///` + subdir)
+			storage, err := cloudimpl.ExternalStorageConfFromURI(`nodelocal://0/`+subdir,
+				security.RootUser)
 			if err != nil {
 				b.Fatalf("%+v", err)
 			}
@@ -173,14 +176,14 @@ func BenchmarkImport(b *testing.B) {
 				{
 					// TODO(dan): The following should probably make it into
 					// dataccl.Backup somehow.
-					tableDesc := backup.Desc.Descriptors[len(backup.Desc.Descriptors)-1].GetTable()
+					tableDesc := backup.Desc.Descriptors[len(backup.Desc.Descriptors)-1].Table(hlc.Timestamp{})
 					if tableDesc == nil || tableDesc.ParentID == keys.SystemDatabaseID {
 						b.Fatalf("bad table descriptor: %+v", tableDesc)
 					}
-					oldStartKey = sqlbase.MakeIndexKeyPrefix(tableDesc, tableDesc.PrimaryIndex.ID)
-					newDesc := *tableDesc
+					oldStartKey = sqlbase.MakeIndexKeyPrefix(keys.SystemSQLCodec, tableDesc, tableDesc.PrimaryIndex.ID)
+					newDesc := sqlbase.NewMutableCreatedTableDescriptor(*tableDesc)
 					newDesc.ID = id
-					newDescBytes, err := protoutil.Marshal(sqlbase.WrapDescriptor(&newDesc))
+					newDescBytes, err := protoutil.Marshal(newDesc.DescriptorProto())
 					if err != nil {
 						panic(err)
 					}
@@ -188,7 +191,7 @@ func BenchmarkImport(b *testing.B) {
 						OldID: uint32(tableDesc.ID), NewDesc: newDescBytes,
 					})
 				}
-				newStartKey := roachpb.Key(keys.MakeTablePrefix(uint32(id)))
+				newStartKey := keys.SystemSQLCodec.TablePrefix(uint32(id))
 
 				b.StartTimer()
 				var files []roachpb.ImportRequest_File
@@ -204,7 +207,7 @@ func BenchmarkImport(b *testing.B) {
 					Files:         files,
 					Rekeys:        rekeys,
 				}
-				res, pErr := client.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
+				res, pErr := kv.SendWrapped(ctx, kvDB.NonTransactionalSender(), req)
 				if pErr != nil {
 					b.Fatalf("%+v", pErr.GoError())
 				}

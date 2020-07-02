@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package sql
 
@@ -18,11 +14,14 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 type dropViewNode struct {
@@ -37,11 +36,8 @@ type dropViewNode struct {
 func (p *planner) DropView(ctx context.Context, n *tree.DropView) (planNode, error) {
 	td := make([]toDelete, 0, len(n.Names))
 	for i := range n.Names {
-		tn, err := n.Names[i].Normalize()
-		if err != nil {
-			return nil, err
-		}
-		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, requireViewDesc)
+		tn := &n.Names[i]
+		droppedDesc, err := p.prepareDrop(ctx, tn, !n.IfExists, resolver.ResolveRequireViewDesc)
 		if err != nil {
 			return nil, err
 		}
@@ -76,14 +72,24 @@ func (p *planner) DropView(ctx context.Context, n *tree.DropView) (planNode, err
 	return &dropViewNode{n: n, td: td}, nil
 }
 
+// ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
+// This is because DROP VIEW performs multiple KV operations on descriptors
+// and expects to see its own writes.
+func (n *dropViewNode) ReadingOwnWrites() {}
+
 func (n *dropViewNode) startExec(params runParams) error {
+	telemetry.Inc(sqltelemetry.SchemaChangeDropCounter("view"))
+
 	ctx := params.ctx
 	for _, toDel := range n.td {
 		droppedDesc := toDel.desc
 		if droppedDesc == nil {
 			continue
 		}
-		cascadeDroppedViews, err := params.p.dropViewImpl(ctx, droppedDesc, n.n.DropBehavior)
+
+		cascadeDroppedViews, err := params.p.dropViewImpl(
+			ctx, droppedDesc, true /* queueJob */, tree.AsStringWithFQNames(n.n, params.Ann()), n.n.DropBehavior,
+		)
 		if err != nil {
 			return err
 		}
@@ -95,7 +101,7 @@ func (n *dropViewNode) startExec(params runParams) error {
 			params.p.txn,
 			EventLogDropView,
 			int32(droppedDesc.ID),
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			struct {
 				ViewName            string
 				Statement           string
@@ -124,7 +130,7 @@ func descInSlice(descID sqlbase.ID, td []toDelete) bool {
 
 func (p *planner) canRemoveDependentView(
 	ctx context.Context,
-	from *sqlbase.TableDescriptor,
+	from *sqlbase.MutableTableDescriptor,
 	ref sqlbase.TableDescriptor_Reference,
 	behavior tree.DropBehavior,
 ) error {
@@ -159,26 +165,30 @@ func (p *planner) canRemoveDependentViewGeneric(
 // Returns the names of any additional views that were also dropped
 // due to `cascade` behavior.
 func (p *planner) removeDependentView(
-	ctx context.Context, tableDesc, viewDesc *sqlbase.TableDescriptor,
+	ctx context.Context, tableDesc, viewDesc *sqlbase.MutableTableDescriptor, jobDesc string,
 ) ([]string, error) {
 	// In the table whose index is being removed, filter out all back-references
 	// that refer to the view that's being removed.
 	tableDesc.DependedOnBy = removeMatchingReferences(tableDesc.DependedOnBy, viewDesc.ID)
 	// Then proceed to actually drop the view and log an event for it.
-	return p.dropViewImpl(ctx, viewDesc, tree.DropCascade)
+	return p.dropViewImpl(ctx, viewDesc, true /* queueJob */, jobDesc, tree.DropCascade)
 }
 
 // dropViewImpl does the work of dropping a view (and views that depend on it
 // if `cascade is specified`). Returns the names of any additional views that
 // were also dropped due to `cascade` behavior.
 func (p *planner) dropViewImpl(
-	ctx context.Context, viewDesc *sqlbase.TableDescriptor, behavior tree.DropBehavior,
+	ctx context.Context,
+	viewDesc *sqlbase.MutableTableDescriptor,
+	queueJob bool,
+	jobDesc string,
+	behavior tree.DropBehavior,
 ) ([]string, error) {
 	var cascadeDroppedViews []string
 
 	// Remove back-references from the tables/views this view depends on.
 	for _, depID := range viewDesc.DependsOn {
-		dependencyDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, depID)
+		dependencyDesc, err := p.Tables().GetMutableTableVersionByID(ctx, depID, p.txn)
 		if err != nil {
 			return cascadeDroppedViews,
 				errors.Errorf("error resolving dependency relation ID %d: %v", depID, err)
@@ -189,7 +199,11 @@ func (p *planner) dropViewImpl(
 			continue
 		}
 		dependencyDesc.DependedOnBy = removeMatchingReferences(dependencyDesc.DependedOnBy, viewDesc.ID)
-		if err := p.saveNonmutationAndNotify(ctx, dependencyDesc); err != nil {
+		if err := p.writeSchemaChange(
+			ctx, dependencyDesc, sqlbase.InvalidMutationID,
+			fmt.Sprintf("removing references for view %s from table %s(%d)",
+				viewDesc.Name, dependencyDesc.Name, dependencyDesc.ID),
+		); err != nil {
 			return cascadeDroppedViews, err
 		}
 	}
@@ -203,7 +217,7 @@ func (p *planner) dropViewImpl(
 			if err != nil {
 				return cascadeDroppedViews, err
 			}
-			cascadedViews, err := p.dropViewImpl(ctx, dependentDesc, behavior)
+			cascadedViews, err := p.dropViewImpl(ctx, dependentDesc, queueJob, "dropping dependent view", behavior)
 			if err != nil {
 				return cascadeDroppedViews, err
 			}
@@ -212,7 +226,7 @@ func (p *planner) dropViewImpl(
 		}
 	}
 
-	if err := p.initiateDropTable(ctx, viewDesc, true /* drainName */); err != nil {
+	if err := p.initiateDropTable(ctx, viewDesc, queueJob, jobDesc, true /* drainName */); err != nil {
 		return cascadeDroppedViews, err
 	}
 
@@ -225,8 +239,8 @@ func (p *planner) getViewDescForCascade(
 	objName string,
 	parentID, viewID sqlbase.ID,
 	behavior tree.DropBehavior,
-) (*sqlbase.TableDescriptor, error) {
-	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, viewID)
+) (*sqlbase.MutableTableDescriptor, error) {
+	viewDesc, err := p.Tables().GetMutableTableVersionByID(ctx, viewID, p.txn)
 	if err != nil {
 		log.Warningf(ctx, "unable to retrieve descriptor for view %d: %v", viewID, err)
 		return nil, errors.Wrapf(err, "error resolving dependent view ID %d", viewID)
@@ -235,17 +249,17 @@ func (p *planner) getViewDescForCascade(
 		viewName := viewDesc.Name
 		if viewDesc.ParentID != parentID {
 			var err error
-			viewName, err = p.getQualifiedTableName(ctx, viewDesc)
+			viewName, err = p.getQualifiedTableName(ctx, viewDesc.TableDesc())
 			if err != nil {
 				log.Warningf(ctx, "unable to retrieve qualified name of view %d: %v", viewID, err)
-				msg := fmt.Sprintf("cannot drop %s %q because a view depends on it", typeName, objName)
-				return nil, sqlbase.NewDependentObjectError(msg)
+				return nil, sqlbase.NewDependentObjectErrorf(
+					"cannot drop %s %q because a view depends on it", typeName, objName)
 			}
 		}
-		msg := fmt.Sprintf("cannot drop %s %q because view %q depends on it",
-			typeName, objName, viewName)
-		hint := fmt.Sprintf("you can drop %s instead.", viewName)
-		return nil, sqlbase.NewDependentObjectErrorWithHint(msg, hint)
+		return nil, errors.WithHintf(
+			sqlbase.NewDependentObjectErrorf("cannot drop %s %q because view %q depends on it",
+				typeName, objName, viewName),
+			"you can drop %s instead.", viewName)
 	}
 	return viewDesc, nil
 }

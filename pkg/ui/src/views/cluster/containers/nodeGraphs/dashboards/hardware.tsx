@@ -1,10 +1,21 @@
+// Copyright 2018 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
 import React from "react";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
 import { Metric, Axis, AxisUnits } from "src/views/shared/components/metricQuery";
 
-import { GraphDashboardProps, nodeDisplayName } from "./dashboardUtils";
-import * as docsURL from "oss/src/util/docs";
+import { GraphDashboardProps, nodeDisplayName, storeIDsForNode } from "./dashboardUtils";
+import { Anchor } from "src/components";
+import { howAreCapacityMetricsCalculated } from "src/util/docs";
 
 // TODO(vilterp): tooltips
 
@@ -13,28 +24,13 @@ export default function (props: GraphDashboardProps) {
 
   return [
     <LineGraph
-      title="User CPU Percent"
+      title="CPU Percent"
       sources={nodeSources}
     >
       <Axis units={AxisUnits.Percentage} label="CPU">
         {nodeIDs.map((nid) => (
           <Metric
-            name="cr.node.sys.cpu.user.percent"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={[nid]}
-          />
-        ))}
-      </Axis>
-    </LineGraph>,
-
-    <LineGraph
-      title="System CPU Percent"
-      sources={nodeSources}
-    >
-      <Axis units={AxisUnits.Percentage} label="CPU">
-        {nodeIDs.map((nid) => (
-          <Metric
-            name="cr.node.sys.cpu.sys.percent"
+            name="cr.node.sys.cpu.combined.percent-normalized"
             title={nodeDisplayName(nodesSummary, nid)}
             sources={[nid]}
           />
@@ -95,6 +91,38 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
+      title="Disk Read Ops"
+      sources={nodeSources}
+    >
+      <Axis units={AxisUnits.Count} label="Read Ops">
+        {nodeIDs.map((nid) => (
+          <Metric
+            name="cr.node.sys.host.disk.read.count"
+            title={nodeDisplayName(nodesSummary, nid)}
+            sources={[nid]}
+            nonNegativeRate
+          />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Disk Write Ops"
+      sources={nodeSources}
+    >
+      <Axis units={AxisUnits.Count} label="Write Ops">
+        {nodeIDs.map((nid) => (
+          <Metric
+            name="cr.node.sys.host.disk.write.count"
+            title={nodeDisplayName(nodesSummary, nid)}
+            sources={[nid]}
+            nonNegativeRate
+          />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
       title="Disk IOPS In Progress"
       sources={nodeSources}
     >
@@ -110,71 +138,25 @@ export default function (props: GraphDashboardProps) {
     </LineGraph>,
 
     <LineGraph
-      title="Disk Read Time"
-      sources={nodeSources}
-    >
-      <Axis units={AxisUnits.Duration} label="Read Time">
-        {nodeIDs.map((nid) => (
-          <Metric
-            name="cr.node.sys.host.disk.read.time"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={[nid]}
-            nonNegativeRate
-          />
-        ))}
-      </Axis>
-    </LineGraph>,
-
-    <LineGraph
-      title="Disk Write Time"
-      sources={nodeSources}
-    >
-      <Axis units={AxisUnits.Duration} label="Write Time">
-        {nodeIDs.map((nid) => (
-          <Metric
-            name="cr.node.sys.host.disk.write.time"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={[nid]}
-            nonNegativeRate
-          />
-        ))}
-      </Axis>
-    </LineGraph>,
-
-    <LineGraph
-      title="Disk Capacity"
+      title="Available Disk Capacity"
       sources={storeSources}
       tooltip={(
         <div>
-          <dl>
-            <dt>Capacity</dt>
-            <dd>
-              Total disk space available {tooltipSelection} to CockroachDB.
-              {" "}
-              <em>
-                Control this value per node with the
-                {" "}
-                <code>
-                  <a href={docsURL.startFlags} target="_blank">
-                    --store
-                  </a>
-                </code>
-                {" "}
-                flag.
-              </em>
-            </dd>
-            <dt>Available</dt>
-            <dd>Free disk space available {tooltipSelection} to CockroachDB.</dd>
-            <dt>Used</dt>
-            <dd>Disk space used {tooltipSelection} by CockroachDB.</dd>
-          </dl>
+          <p>Free disk space available to CockroachDB</p>
+          <Anchor href={howAreCapacityMetricsCalculated}>
+            How is this metric calculated?
+          </Anchor>
         </div>
       )}
     >
       <Axis units={AxisUnits.Bytes} label="capacity">
-        <Metric name="cr.store.capacity" title="Capacity" />
-        <Metric name="cr.store.capacity.available" title="Available" />
-        <Metric name="cr.store.capacity.used" title="Used" />
+        {nodeIDs.map((nid) => (
+          <Metric
+            name="cr.store.capacity.available"
+            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodesSummary, nid)}
+          />
+        ))}
       </Axis>
     </LineGraph>,
 

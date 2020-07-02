@@ -35,7 +35,6 @@
 # details on how this works.
 # =============================================================================
 
-
 # RejectNullsLeftJoin reduces a LeftJoin operator to an InnerJoin operator (or a
 # FullJoin to a RightJoin) when there is a null-rejecting filter on any column
 # from the right side. The effect of the null-rejecting filter is that output
@@ -58,12 +57,14 @@
 # Citations: [1]
 [RejectNullsLeftJoin, Normalize, HighPriority]
 (Select
-    $input:(LeftJoin | LeftJoinApply | FullJoin | FullJoinApply
+    $input:(LeftJoin | LeftJoinApply | FullJoin
         $left:*
         $right:*
         $on:*
+        $private:*
     )
-    $filter:(Filters) & (HasNullRejectingFilter $filter (OutputCols $right))
+    $filters:* &
+        (HasNullRejectingFilter $filters (OutputCols $right))
 )
 =>
 (Select
@@ -72,35 +73,25 @@
         $left
         $right
         $on
+        $private
     )
-    $filter
+    $filters
 )
 
 # RejectNullsRightJoin is symmetric with RejectNullsLeftJoin. It reduces a
-# RightJoin operator to an InnerJoin operator (or a FullJoin to a LeftJoin) when
-# there is a null-rejecting filter on any column from the left side.
+# FullJoin operator to a LeftJoin when there is a null-rejecting filter on any
+# column from the left side.
 #
 # This rule is marked as high priority for the same reason as
 # RejectNullsLeftJoin.
 [RejectNullsRightJoin, Normalize, HighPriority]
 (Select
-    $input:(RightJoin | RightJoinApply | FullJoin | FullJoinApply
-        $left:*
-        $right:*
-        $on:*
-    )
-    $filter:(Filters) & (HasNullRejectingFilter $filter (OutputCols $left))
+    $input:(FullJoin $left:* $right:* $on:* $private:*)
+    $filters:* &
+        (HasNullRejectingFilter $filters (OutputCols $left))
 )
 =>
-(Select
-    (ConstructNonRightJoin
-        (OpName $input)
-        $left
-        $right
-        $on
-    )
-    $filter
-)
+(Select (LeftJoin $left $right $on $private) $filters)
 
 # RejectNullsGroupBy pushes a "col IS NOT NULL" null-rejecting filter below the
 # GroupBy operator if it allows null rejection for that column (i.e. if it's in
@@ -117,7 +108,7 @@
 # an InnerJoin operator.
 #
 # This rule is not useful for DistinctOn: it can only fire if there are no
-# FIrstAgg aggregates, but in that case the filter would have gotten pushed
+# FirstAgg aggregates, but in that case the filter would have gotten pushed
 # through DistinctOn.
 #
 # This rule is marked as low priority so that it runs after Select filter
@@ -125,22 +116,36 @@
 # preferable to synthesizing a new "col IS NOT NULL" filter.
 [RejectNullsGroupBy, Normalize, LowPriority]
 (Select
-    $input:(GroupBy
+    $input:(GroupBy | ScalarGroupBy
         $innerInput:*
         $aggregations:*
-        $def:*
+        $groupingPrivate:*
     )
-    $filter:(Filters) & (HasNullRejectingFilter $filter (RejectNullCols $input))
+    $filters:* &
+        (HasNullRejectingFilter
+            $filters
+            $rejectCols:(RejectNullCols $input)
+        )
 )
 =>
 (Select
     ((OpName $input)
         (Select
             $innerInput
-            (Filters [(IsNot (NullRejectAggVar $aggregations) (Null (AnyType)))])
+            [
+                (FiltersItem
+                    (IsNot
+                        (NullRejectAggVar
+                            $aggregations
+                            $rejectCols
+                        )
+                        (Null (AnyType))
+                    )
+                )
+            ]
         )
         $aggregations
-        $def
+        $groupingPrivate
     )
-    $filter
+    $filters
 )

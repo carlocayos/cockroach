@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package status
 
@@ -28,30 +24,24 @@ func TestSumDiskCounters(t *testing.T) {
 	counters := []diskStats{
 		{
 			readBytes:      1,
-			readTime:       1,
 			readCount:      1,
 			iopsInProgress: 1,
 			writeBytes:     1,
-			writeTime:      1,
 			writeCount:     1,
 		},
 		{
 			readBytes:      1,
-			readTime:       1,
 			readCount:      1,
 			iopsInProgress: 1,
 			writeBytes:     1,
-			writeTime:      1,
 			writeCount:     1,
 		},
 	}
 	summed := sumDiskCounters(counters)
 	expected := diskStats{
 		readBytes:      2,
-		readTime:       2,
 		readCount:      2,
 		writeBytes:     2,
-		writeTime:      2,
 		writeCount:     2,
 		iopsInProgress: 2,
 	}
@@ -94,28 +84,22 @@ func TestSubtractDiskCounters(t *testing.T) {
 
 	from := diskStats{
 		readBytes:      3,
-		readTime:       3,
 		readCount:      3,
 		writeBytes:     3,
-		writeTime:      3,
 		writeCount:     3,
 		iopsInProgress: 3,
 	}
 	sub := diskStats{
 		readBytes:      1,
-		readTime:       1,
 		readCount:      1,
 		iopsInProgress: 1,
 		writeBytes:     1,
-		writeTime:      1,
 		writeCount:     1,
 	}
 	expected := diskStats{
 		readBytes:  2,
-		readTime:   2,
 		readCount:  2,
 		writeBytes: 2,
-		writeTime:  2,
 		writeCount: 2,
 		// Don't touch iops in progress; it is a gauge, not a counter.
 		iopsInProgress: 3,

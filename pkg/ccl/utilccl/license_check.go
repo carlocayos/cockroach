@@ -19,19 +19,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
-var enterpriseLicense = settings.RegisterValidatedStringSetting(
-	"enterprise.license",
-	"the encoded cluster license",
-	"",
-	func(sv *settings.Values, s string) error {
-		_, err := licenseccl.Decode(s)
-		return err
-	},
-)
-
-func init() {
-	enterpriseLicense.Hide()
-}
+var enterpriseLicense = func() *settings.StringSetting {
+	s := settings.RegisterValidatedStringSetting(
+		"enterprise.license",
+		"the encoded cluster license",
+		"",
+		func(sv *settings.Values, s string) error {
+			_, err := licenseccl.Decode(s)
+			return err
+		},
+	)
+	// Even though string settings are non-reportable by default, we
+	// still mark them explicitly in case a future code change flips the
+	// default.
+	s.SetReportable(false)
+	s.SetVisibility(settings.Public)
+	return s
+}()
 
 var testingEnterpriseEnabled = false
 

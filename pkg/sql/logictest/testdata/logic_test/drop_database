@@ -1,4 +1,4 @@
-# LogicTest: local local-opt
+# LogicTest: local
 
 statement ok
 CREATE DATABASE "foo-bar"
@@ -33,6 +33,12 @@ defaultdb
 postgres
 system
 test
+
+query TT
+SELECT job_type, status FROM [SHOW JOBS]
+----
+SCHEMA CHANGE       succeeded
+SCHEMA CHANGE GC    running
 
 statement ok
 CREATE DATABASE "foo bar"
@@ -241,3 +247,15 @@ DROP DATABASE defaultdb; DROP DATABASE postgres
 
 statement ok
 CREATE DATABASE defaultdb; CREATE DATABASE postgres
+
+# Test that an empty database doesn't get a GC job.
+statement ok
+CREATE DATABASE empty
+
+statement ok
+DROP DATABASE empty
+
+query TT
+SELECT job_type, status FROM [SHOW JOBS] WHERE description LIKE '%empty%'
+----
+SCHEMA CHANGE       succeeded

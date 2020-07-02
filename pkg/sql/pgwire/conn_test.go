@@ -1,37 +1,35 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package pgwire
 
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx"
-	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -47,6 +45,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx"
+	"github.com/jackc/pgx/pgproto3"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 // Test the conn struct: check that it marshalls the correct commands to the
@@ -70,7 +73,7 @@ func TestConn(t *testing.T) {
 	// execute some metadata queries that pgx sends whenever it opens a
 	// connection.
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true, UseDatabase: "system"})
-	defer s.Stopper().Stop(context.TODO())
+	defer s.Stopper().Stop(context.Background())
 
 	// Start a pgwire "server".
 	addr := util.TestAddr
@@ -79,9 +82,10 @@ func TestConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverAddr := ln.Addr()
+	log.Infof(context.Background(), "started listener on %s", serverAddr)
 
 	var g errgroup.Group
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	var clientWG sync.WaitGroup
 	clientWG.Add(1)
@@ -100,13 +104,15 @@ func TestConn(t *testing.T) {
 	// buffer.
 	serveCtx, stopServe := context.WithCancel(ctx)
 	g.Go(func() error {
-		return conn.serveImpl(
+		conn.serveImpl(
 			serveCtx,
 			func() bool { return false }, /* draining */
 			// sqlServer - nil means don't create a command processor and a write side of the conn
 			nil,
 			mon.BoundAccount{}, /* reserved */
+			authOptions{testingSkipAuth: true},
 			s.Stopper())
+		return nil
 	})
 	defer stopServe()
 
@@ -116,7 +122,7 @@ func TestConn(t *testing.T) {
 
 	// Now we'll expect to receive the commands corresponding to the operations in
 	// client().
-	rd := sql.MakeStmtBufReader(conn.stmtBuf)
+	rd := sql.MakeStmtBufReader(&conn.stmtBuf)
 	expectExecStmt(ctx, t, "SELECT 1", &rd, conn, queryStringComplete)
 	expectSync(ctx, t, &rd)
 	expectExecStmt(ctx, t, "SELECT 2", &rd, conn, queryStringComplete)
@@ -170,7 +176,7 @@ func TestConn(t *testing.T) {
 	expectSync(ctx, t, &rd)
 
 	// Test that parse error turns into SendError.
-	expectSendError(ctx, t, pgerror.CodeSyntaxError, &rd, conn)
+	expectSendError(ctx, t, pgcode.Syntax, &rd, conn)
 
 	clientWG.Done()
 
@@ -182,30 +188,36 @@ func TestConn(t *testing.T) {
 // processPgxStartup processes the first few queries that the pgx driver
 // automatically sends on a new connection that has been established.
 func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c *conn) error {
-	rd := sql.MakeStmtBufReader(c.stmtBuf)
+	rd := sql.MakeStmtBufReader(&c.stmtBuf)
 
 	for {
 		cmd, err := rd.CurCmd()
 		if err != nil {
+			log.Errorf(ctx, "CurCmd error: %v", err)
 			return err
 		}
 
 		if _, ok := cmd.(sql.Sync); ok {
+			log.Infof(ctx, "advancing Sync")
 			rd.AdvanceOne()
 			continue
 		}
 
 		exec, ok := cmd.(sql.ExecStmt)
 		if !ok {
+			log.Infof(ctx, "stop wait at: %v", cmd)
 			return nil
 		}
-		query := exec.Stmt.String()
+		query := exec.AST.String()
 		if !strings.HasPrefix(query, "SELECT t.oid") {
+			log.Infof(ctx, "stop wait at query: %s", query)
 			return nil
 		}
 		if err := execQuery(ctx, query, s, c); err != nil {
+			log.Errorf(ctx, "execQuery %s error: %v", query, err)
 			return err
 		}
+		log.Infof(ctx, "executed query: %s", query)
 		rd.AdvanceOne()
 	}
 }
@@ -214,8 +226,10 @@ func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c
 func execQuery(
 	ctx context.Context, query string, s serverutils.TestServerInterface, c *conn,
 ) error {
-	rows, cols, err := s.InternalExecutor().(sqlutil.InternalExecutor).Query(
-		ctx, "test", nil /* txn */, query,
+	rows, cols, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryWithCols(
+		ctx, "test", nil, /* txn */
+		sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser, Database: "system"},
+		query,
 	)
 	if err != nil {
 		return err
@@ -234,9 +248,10 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	}
 	conn, err := pgx.Connect(
 		pgx.ConnConfig{
-			Host: host,
-			Port: uint16(port),
-			User: "root",
+			Logger: pgxTestLogger{},
+			Host:   host,
+			Port:   uint16(port),
+			User:   "root",
 			// Setting this so that the queries sent by pgx to initialize the
 			// connection are not using prepared statements. That simplifies the
 			// scaffolding of the test.
@@ -246,7 +261,6 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	if err != nil {
 		return err
 	}
-	conn.SetLogger(pgxTestLogger{})
 
 	if _, err := conn.Exec("select 1"); err != nil {
 		return err
@@ -274,7 +288,7 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	batch := conn.BeginBatch()
 	batch.Queue("select 7", nil, nil, nil)
 	batch.Queue("select 8", nil, nil, nil)
-	if err := batch.Send(context.TODO(), &pgx.TxOptions{}); err != nil {
+	if err := batch.Send(context.Background(), &pgx.TxOptions{}); err != nil {
 		return err
 	}
 	if err := batch.Close(); err != nil {
@@ -317,20 +331,20 @@ func waitForClientConn(ln net.Listener) (*conn, error) {
 		return nil, errors.Errorf("unexpected protocol version: %d", version)
 	}
 
-	// Consumer the connection options.
-	if _, err := parseOptions(context.TODO(), buf.Msg); err != nil {
+	// Consume the connection options.
+	if _, err := parseClientProvidedSessionParameters(context.Background(), nil, &buf); err != nil {
 		return nil, err
 	}
 
 	metrics := makeServerMetrics(sql.MemoryMetrics{} /* sqlMemMetrics */, metric.TestSampleInterval)
-	pgwireConn := newConn(conn, sql.SessionArgs{}, &metrics, &sql.ExecutorConfig{})
+	pgwireConn := newConn(conn, sql.SessionArgs{ConnResultsBufferSize: 16 << 10}, &metrics, nil)
 	return pgwireConn, nil
 }
 
 func makeTestingConvCfg() sessiondata.DataConversionConfig {
 	return sessiondata.DataConversionConfig{
 		Location:          time.UTC,
-		BytesEncodeFormat: sessiondata.BytesEncodeHex,
+		BytesEncodeFormat: lex.BytesEncodeHex,
 	}
 }
 
@@ -350,8 +364,8 @@ func sendResult(
 	for _, row := range rows {
 		c.msgBuilder.initMsg(pgwirebase.ServerMsgDataRow)
 		c.msgBuilder.putInt16(int16(len(row)))
-		for _, col := range row {
-			c.msgBuilder.writeTextDatum(ctx, col, defaultConv)
+		for i, col := range row {
+			c.msgBuilder.writeTextDatum(ctx, col, defaultConv, cols[i].Typ)
 		}
 
 		if err := c.msgBuilder.finishMsg(c.conn); err != nil {
@@ -372,6 +386,7 @@ const (
 func expectExecStmt(
 	ctx context.Context, t *testing.T, expSQL string, rd *sql.StmtBufReader, c *conn, typ executeType,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -380,18 +395,18 @@ func expectExecStmt(
 
 	es, ok := cmd.(sql.ExecStmt)
 	if !ok {
-		t.Fatalf("%s: expected command ExecStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command ExecStmt, got: %T (%+v)", cmd, cmd)
 	}
 
-	if es.Stmt.String() != expSQL {
-		t.Fatalf("%s: expected %s, got %s", testutils.Caller(1), expSQL, es.Stmt.String())
+	if es.AST.String() != expSQL {
+		t.Fatalf("expected %s, got %s", expSQL, es.AST.String())
 	}
 
 	if es.ParseStart == (time.Time{}) {
-		t.Fatalf("%s: ParseStart not filled in", testutils.Caller(1))
+		t.Fatalf("ParseStart not filled in")
 	}
 	if es.ParseEnd == (time.Time{}) {
-		t.Fatalf("%s: ParseEnd not filled in", testutils.Caller(1))
+		t.Fatalf("ParseEnd not filled in")
 	}
 	if typ == queryStringComplete {
 		if err := finishQuery(execute, c); err != nil {
@@ -407,6 +422,7 @@ func expectExecStmt(
 func expectPrepareStmt(
 	ctx context.Context, t *testing.T, expName string, expSQL string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -415,15 +431,15 @@ func expectPrepareStmt(
 
 	pr, ok := cmd.(sql.PrepareStmt)
 	if !ok {
-		t.Fatalf("%s: expected command PrepareStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command PrepareStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if pr.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, pr.Name)
+		t.Fatalf("expected name %s, got %s", expName, pr.Name)
 	}
 
-	if pr.Stmt.String() != expSQL {
-		t.Fatalf("%s: expected %s, got %s", testutils.Caller(1), expSQL, pr.Stmt.String())
+	if pr.AST.String() != expSQL {
+		t.Fatalf("expected %s, got %s", expSQL, pr.AST.String())
 	}
 
 	if err := finishQuery(prepare, c); err != nil {
@@ -439,6 +455,7 @@ func expectDescribeStmt(
 	rd *sql.StmtBufReader,
 	c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -447,15 +464,15 @@ func expectDescribeStmt(
 
 	desc, ok := cmd.(sql.DescribeStmt)
 	if !ok {
-		t.Fatalf("%s: expected command DescribeStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command DescribeStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if desc.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, desc.Name)
+		t.Fatalf("expected name %s, got %s", expName, desc.Name)
 	}
 
 	if desc.Type != expType {
-		t.Fatalf("%s: expected type %s, got %s", testutils.Caller(1), expType, desc.Type)
+		t.Fatalf("expected type %s, got %s", expType, desc.Type)
 	}
 
 	if err := finishQuery(describe, c); err != nil {
@@ -466,6 +483,7 @@ func expectDescribeStmt(
 func expectBindStmt(
 	ctx context.Context, t *testing.T, expName string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -474,11 +492,11 @@ func expectBindStmt(
 
 	bd, ok := cmd.(sql.BindStmt)
 	if !ok {
-		t.Fatalf("%s: expected command BindStmt, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command BindStmt, got: %T (%+v)", cmd, cmd)
 	}
 
 	if bd.PreparedStatementName != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, bd.PreparedStatementName)
+		t.Fatalf("expected name %s, got %s", expName, bd.PreparedStatementName)
 	}
 
 	if err := finishQuery(bind, c); err != nil {
@@ -487,6 +505,7 @@ func expectBindStmt(
 }
 
 func expectSync(ctx context.Context, t *testing.T, rd *sql.StmtBufReader) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -495,13 +514,14 @@ func expectSync(ctx context.Context, t *testing.T, rd *sql.StmtBufReader) {
 
 	_, ok := cmd.(sql.Sync)
 	if !ok {
-		t.Fatalf("%s: expected command Sync, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command Sync, got: %T (%+v)", cmd, cmd)
 	}
 }
 
 func expectExecPortal(
 	ctx context.Context, t *testing.T, expName string, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -510,11 +530,11 @@ func expectExecPortal(
 
 	ep, ok := cmd.(sql.ExecPortal)
 	if !ok {
-		t.Fatalf("%s: expected command ExecPortal, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command ExecPortal, got: %T (%+v)", cmd, cmd)
 	}
 
 	if ep.Name != expName {
-		t.Fatalf("%s: expected name %s, got %s", testutils.Caller(1), expName, ep.Name)
+		t.Fatalf("expected name %s, got %s", expName, ep.Name)
 	}
 
 	if err := finishQuery(execPortal, c); err != nil {
@@ -523,8 +543,9 @@ func expectExecPortal(
 }
 
 func expectSendError(
-	ctx context.Context, t *testing.T, pgErrCode string, rd *sql.StmtBufReader, c *conn,
+	ctx context.Context, t *testing.T, pgErrCode pgcode.Code, rd *sql.StmtBufReader, c *conn,
 ) {
+	t.Helper()
 	cmd, err := rd.CurCmd()
 	if err != nil {
 		t.Fatal(err)
@@ -533,15 +554,11 @@ func expectSendError(
 
 	se, ok := cmd.(sql.SendError)
 	if !ok {
-		t.Fatalf("%s: expected command SendError, got: %T (%+v)", testutils.Caller(1), cmd, cmd)
+		t.Fatalf("expected command SendError, got: %T (%+v)", cmd, cmd)
 	}
 
-	pg, ok := se.Err.(*pgerror.Error)
-	if !ok {
-		t.Fatalf("expected pgerror, got %T (%s)", se.Err, se.Err)
-	}
-	if pg.Code != pgErrCode {
-		t.Fatalf("expected code %s, got: %s", pgErrCode, pg.Code)
+	if code := pgerror.GetPGCode(se.Err); code != pgErrCode {
+		t.Fatalf("expected code %s, got: %s", pgErrCode, code)
 	}
 
 	if err := finishQuery(execPortal, c); err != nil {
@@ -585,7 +602,7 @@ func finishQuery(t finishType, c *conn) error {
 	case describe:
 		skipFinish = true
 		if err := c.writeRowDescription(
-			context.TODO(), nil /* columns */, nil /* formatCodes */, c.conn,
+			context.Background(), nil /* columns */, nil /* formatCodes */, c.conn,
 		); err != nil {
 			return err
 		}
@@ -624,11 +641,74 @@ func finishQuery(t finishType, c *conn) error {
 type pgxTestLogger struct{}
 
 func (l pgxTestLogger) Log(level pgx.LogLevel, msg string, data map[string]interface{}) {
-	log.Infof(context.TODO(), "pgx log [%s] %s - %s", level, msg, data)
+	log.Infof(context.Background(), "pgx log [%s] %s - %s", level, msg, data)
 }
 
 // pgxTestLogger implements pgx.Logger.
 var _ pgx.Logger = pgxTestLogger{}
+
+// Test that closing a pgwire connection causes transactions to be rolled back
+// and release their locks.
+func TestConnCloseReleasesLocks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// We're going to test closing the connection in both the Open and Aborted
+	// state.
+	testutils.RunTrueAndFalse(t, "open state", func(t *testing.T, open bool) {
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		ctx := context.Background()
+		defer s.Stopper().Stop(ctx)
+
+		pgURL, cleanupFunc := sqlutils.PGUrl(
+			t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
+		)
+		defer cleanupFunc()
+		db, err := gosql.Open("postgres", pgURL.String())
+		require.NoError(t, err)
+		defer db.Close()
+
+		r := sqlutils.MakeSQLRunner(db)
+		r.Exec(t, "CREATE DATABASE test")
+		r.Exec(t, "CREATE TABLE test.t (x int primary key)")
+
+		pgxConfig, err := pgx.ParseConnectionString(pgURL.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		conn, err := pgx.Connect(pgxConfig)
+		require.NoError(t, err)
+		tx, err := conn.Begin()
+		require.NoError(t, err)
+		_, err = tx.Exec("INSERT INTO test.t(x) values (1)")
+		require.NoError(t, err)
+		readCh := make(chan error)
+		go func() {
+			conn2, err := pgx.Connect(pgxConfig)
+			require.NoError(t, err)
+			_, err = conn2.Exec("SELECT * FROM test.t")
+			readCh <- err
+		}()
+
+		select {
+		case err := <-readCh:
+			t.Fatalf("unexpected read unblocked: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		if !open {
+			_, err = tx.Exec("bogus")
+			require.NotNil(t, err)
+		}
+		err = conn.Close()
+		require.NoError(t, err)
+		select {
+		case readErr := <-readCh:
+			require.NoError(t, readErr)
+		case <-time.After(10 * time.Second):
+			t.Fatal("read not unblocked in a timely manner")
+		}
+	})
+}
 
 // Test that closing a client connection such that producing results rows
 // encounters network errors doesn't crash the server (#23694).
@@ -640,40 +720,40 @@ var _ pgx.Logger = pgxTestLogger{}
 // b) the connection's server-side results buffer has overflowed, and so
 // attempting to produce results (through CommandResult.AddRow()) observes
 // network errors.
-func TestConnClose(t *testing.T) {
+func TestConnCloseWhileProducingRows(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Make the connections' results buffers really small so that it overflows
-		// when we produce a few results.
-		ConnResultsBufferBytes: 10,
-		// Andrei is too lazy to figure out the incantation for telling pgx about
-		// our test certs.
-		Insecure: true,
-	})
-	ctx := context.TODO()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
-	r := sqlutils.MakeSQLRunner(db)
-	r.Exec(t, "CREATE DATABASE test")
-	r.Exec(t, "CREATE TABLE test.test AS SELECT * FROM generate_series(1,100)")
-
-	host, ports, err := net.SplitHostPort(s.ServingAddr())
+	// Disable results buffering.
+	if _, err := db.Exec(
+		`SET CLUSTER SETTING sql.defaults.results_buffer.size = '0'`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	pgURL, cleanupFunc := sqlutils.PGUrl(
+		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(security.RootUser),
+	)
+	defer cleanupFunc()
+	noBufferDB, err := gosql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	port, err := strconv.Atoi(ports)
+	defer noBufferDB.Close()
+
+	r := sqlutils.MakeSQLRunner(noBufferDB)
+	r.Exec(t, "CREATE DATABASE test")
+	r.Exec(t, "CREATE TABLE test.test AS SELECT * FROM generate_series(1,100)")
+
+	pgxConfig, err := pgx.ParseConnectionString(pgURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	// We test both with and without DistSQL, as the way that network errors are
 	// observed depends on the engine.
 	testutils.RunTrueAndFalse(t, "useDistSQL", func(t *testing.T, useDistSQL bool) {
-		conn, err := pgx.Connect(pgx.ConnConfig{
-			Host:     host,
-			Port:     uint16(port),
-			User:     "root",
-			Database: "system",
-		})
+		conn, err := pgx.Connect(pgxConfig)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -704,7 +784,7 @@ func TestConnClose(t *testing.T) {
 func TestMaliciousInputs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	ctx := context.TODO()
+	ctx := context.Background()
 
 	for _, tc := range [][]byte{
 		// This byte string sends a pgwirebase.ClientMsgClose message type. When
@@ -758,14 +838,20 @@ func TestMaliciousInputs(t *testing.T) {
 			sqlMetrics := sql.MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
 			metrics := makeServerMetrics(sqlMetrics, time.Second /* histogramWindow */)
 
-			conn := newConn(r, sql.SessionArgs{}, &metrics, nil /* execCfg */)
+			conn := newConn(
+				// ConnResultsBufferBytes - really small so that it overflows
+				// when we produce a few results.
+				r, sql.SessionArgs{ConnResultsBufferSize: 10}, &metrics,
+				nil,
+			)
 			// Ignore the error from serveImpl. There might be one when the client
 			// sends malformed input.
-			_ /* err */ = conn.serveImpl(
+			conn.serveImpl(
 				ctx,
 				func() bool { return false }, /* draining */
-				nil,                /* sqlServer */
-				mon.BoundAccount{}, /* reserved */
+				nil,                          /* sqlServer */
+				mon.BoundAccount{},           /* reserved */
+				authOptions{testingSkipAuth: true},
 				stopper,
 			)
 			if err := <-errChan; err != nil {
@@ -784,6 +870,7 @@ func TestReadTimeoutConnExits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	log.Infof(context.Background(), "started listener on %s", ln.Addr())
 	defer func() {
 		if err := ln.Close(); err != nil {
 			t.Fatal(err)
@@ -804,7 +891,7 @@ func TestReadTimeoutConnExits(t *testing.T) {
 			}
 			defer c.Close()
 
-			readTimeoutConn := newReadTimeoutConn(c, ctx.Err)
+			readTimeoutConn := newReadTimeoutConn(c, func() error { return ctx.Err() })
 			// Assert that reads are performed normally.
 			readBytes := make([]byte, len(expectedRead))
 			if _, err := readTimeoutConn.Read(readBytes); err != nil {
@@ -837,7 +924,126 @@ func TestReadTimeoutConnExits(t *testing.T) {
 	default:
 	}
 	cancel()
-	if err := <-errChan; err != context.Canceled {
+	if err := <-errChan; !errors.Is(err, context.Canceled) {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestConnResultsBufferSize(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.Background())
+
+	// Check that SHOW results_buffer_size correctly exposes the value when it
+	// inherits the default.
+	{
+		var size string
+		require.NoError(t, db.QueryRow(`SHOW results_buffer_size`).Scan(&size))
+		require.Equal(t, `16384`, size)
+	}
+
+	pgURL, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	defer cleanup()
+	q := pgURL.Query()
+
+	q.Add(`results_buffer_size`, `foo`)
+	pgURL.RawQuery = q.Encode()
+	{
+		errDB, err := gosql.Open("postgres", pgURL.String())
+		require.NoError(t, err)
+		defer errDB.Close()
+		_, err = errDB.Exec(`SELECT 1`)
+		require.EqualError(t, err,
+			`pq: error parsing results_buffer_size option value 'foo' as bytes`)
+	}
+
+	q.Del(`results_buffer_size`)
+	q.Add(`results_buffer_size`, `-1`)
+	pgURL.RawQuery = q.Encode()
+	{
+		errDB, err := gosql.Open("postgres", pgURL.String())
+		require.NoError(t, err)
+		defer errDB.Close()
+		_, err = errDB.Exec(`SELECT 1`)
+		require.EqualError(t, err, `pq: results_buffer_size option value '-1' cannot be negative`)
+	}
+
+	// Set the results_buffer_size to a very small value, eliminating buffering.
+	q.Del(`results_buffer_size`)
+	q.Add(`results_buffer_size`, `2`)
+	pgURL.RawQuery = q.Encode()
+
+	noBufferDB, err := gosql.Open("postgres", pgURL.String())
+	require.NoError(t, err)
+	defer noBufferDB.Close()
+
+	var size string
+	require.NoError(t, noBufferDB.QueryRow(`SHOW results_buffer_size`).Scan(&size))
+	require.Equal(t, `2`, size)
+
+	// Run a query that immediately returns one result and then pauses for a
+	// long time while computing the second.
+	rows, err := noBufferDB.Query(
+		`SELECT a, if(a = 1, pg_sleep(99999), false) from (VALUES (0), (1)) AS foo (a)`)
+	require.NoError(t, err)
+
+	// Verify that the first result has been flushed.
+	require.True(t, rows.Next())
+	var a int
+	var b bool
+	require.NoError(t, rows.Scan(&a, &b))
+	require.Equal(t, 0, a)
+	require.False(t, b)
+}
+
+// Test that closing a connection while authentication was ongoing cancels the
+// auhentication process. In other words, this checks that the server is reading
+// from the connection while authentication is ongoing and so it reacts to the
+// connection closing.
+func TestConnCloseCancelsAuth(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	authBlocked := make(chan struct{})
+	s, _, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			Insecure: true,
+			Knobs: base.TestingKnobs{
+				PGWireTestingKnobs: &sql.PGWireTestingKnobs{
+					AuthHook: func(ctx context.Context) error {
+						// Notify the test.
+						authBlocked <- struct{}{}
+						// Wait for context cancelation.
+						<-ctx.Done()
+						// Notify the test.
+						close(authBlocked)
+						return fmt.Errorf("test auth canceled")
+					},
+				},
+			},
+		})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	// We're going to open a client connection and do the minimum so that the
+	// server gets to the authentication phase, where it will block.
+	conn, err := net.Dial("tcp", s.ServingSQLAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fe, err := pgproto3.NewFrontend(conn, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fe.Send(&pgproto3.StartupMessage{ProtocolVersion: version30}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for server to block the auth.
+	<-authBlocked
+	// Close the connection. This is supposed to unblock the auth by canceling its
+	// ctx.
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Check that the auth process indeed noticed the cancelation.
+	<-authBlocked
 }

@@ -1,44 +1,41 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package stats
 
 import (
 	"context"
+	"math/rand"
+	"reflect"
+	"sort"
+	"sync"
 	"testing"
-
 	"time"
 
-	"reflect"
-
-	"sort"
-
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func insertTableStat(
-	ctx context.Context, db *client.DB, ex sqlutil.InternalExecutor, stat *TableStatistic,
+	ctx context.Context, db *kv.DB, ex sqlutil.InternalExecutor, stat *TableStatisticProto,
 ) error {
 	insertStatStmt := `
 INSERT INTO system.table_statistics ("tableID", "statisticID", name, "columnIDs", "createdAt",
@@ -66,8 +63,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	if len(stat.Name) != 0 {
 		args[2] = stat.Name
 	}
-	if stat.Histogram != nil {
-		histogramBytes, err := protoutil.Marshal(stat.Histogram)
+	if stat.HistogramData != nil {
+		histogramBytes, err := protoutil.Marshal(stat.HistogramData)
 		if err != nil {
 			return err
 		}
@@ -86,11 +83,25 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 
 }
 
+func lookupTableStats(
+	ctx context.Context, sc *TableStatisticsCache, tableID sqlbase.ID,
+) ([]*TableStatistic, bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if e, ok := sc.mu.cache.Get(tableID); ok {
+		return e.(*cacheEntry).stats, true
+	}
+	return nil, false
+}
+
 func checkStatsForTable(
-	ctx context.Context, sc *TableStatisticsCache, expected []*TableStatistic, tableID sqlbase.ID,
+	ctx context.Context,
+	sc *TableStatisticsCache,
+	expected []*TableStatisticProto,
+	tableID sqlbase.ID,
 ) error {
 	// Initially the stats won't be in the cache.
-	if statsList, ok := sc.lookupTableStats(ctx, tableID); ok {
+	if statsList, ok := lookupTableStats(ctx, sc, tableID); ok {
 		return errors.Errorf("lookup of missing key %d returned: %s", tableID, statsList)
 	}
 
@@ -98,25 +109,37 @@ func checkStatsForTable(
 	// returned stats match the expected values.
 	statsList, err := sc.GetTableStats(ctx, tableID)
 	if err != nil {
-		return errors.Errorf(err.Error())
+		return errors.Wrap(err, "retrieving stats")
 	}
-	if !reflect.DeepEqual(statsList, expected) {
+	if !checkStats(statsList, expected) {
 		return errors.Errorf("for lookup of key %d, expected stats %s, got %s", tableID, expected, statsList)
 	}
 
 	// Now the stats should be in the cache.
-	if _, ok := sc.lookupTableStats(ctx, tableID); !ok {
+	if _, ok := lookupTableStats(ctx, sc, tableID); !ok {
 		return errors.Errorf("for lookup of key %d, expected stats %s", tableID, expected)
 	}
 	return nil
 }
 
+func checkStats(actual []*TableStatistic, expected []*TableStatisticProto) bool {
+	if len(actual) == 0 && len(expected) == 0 {
+		// DeepEqual differentiates between nil and empty slices, we don't.
+		return true
+	}
+	var protoList []*TableStatisticProto
+	for i := range actual {
+		protoList = append(protoList, &actual[i].TableStatisticProto)
+	}
+	return reflect.DeepEqual(protoList, expected)
+}
+
 func initTestData(
-	ctx context.Context, db *client.DB, ex sqlutil.InternalExecutor,
-) (map[sqlbase.ID][]*TableStatistic, error) {
+	ctx context.Context, db *kv.DB, ex sqlutil.InternalExecutor,
+) (map[sqlbase.ID][]*TableStatisticProto, error) {
 	// The expected stats must be ordered by TableID+, CreatedAt- so they can
 	// later be compared with the returned stats using reflect.DeepEqual.
-	expStatsList := []TableStatistic{
+	expStatsList := []TableStatisticProto{
 		{
 			TableID:       sqlbase.ID(100),
 			StatisticID:   0,
@@ -126,7 +149,7 @@ func initTestData(
 			RowCount:      32,
 			DistinctCount: 30,
 			NullCount:     0,
-			Histogram: &HistogramData{Buckets: []HistogramData_Bucket{
+			HistogramData: &HistogramData{ColumnType: types.Int, Buckets: []HistogramData_Bucket{
 				{NumEq: 3, NumRange: 30, UpperBound: encoding.EncodeVarintAscending(nil, 3000)}},
 			},
 		},
@@ -162,7 +185,7 @@ func initTestData(
 
 	// Insert the stats into system.table_statistics
 	// and store them in maps for fast retrieval.
-	expectedStats := make(map[sqlbase.ID][]*TableStatistic)
+	expectedStats := make(map[sqlbase.ID][]*TableStatisticProto)
 	for i := range expStatsList {
 		stat := &expStatsList[i]
 
@@ -179,7 +202,7 @@ func initTestData(
 	return expectedStats, nil
 }
 
-func TestTableStatisticsCache(t *testing.T) {
+func TestCacheBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
@@ -203,7 +226,13 @@ func TestTableStatisticsCache(t *testing.T) {
 	// Create a cache and iteratively query the cache for each tableID. This
 	// will result in the cache getting populated. When the stats cache size is
 	// exceeded, entries should be evicted according to the LRU policy.
-	sc := NewTableStatisticsCache(2 /* cacheSize */, s.Gossip(), db, ex)
+	sc := NewTableStatisticsCache(
+		2, /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		db,
+		ex,
+		keys.SystemSQLCodec,
+	)
 	for _, tableID := range tableIDs {
 		if err := checkStatsForTable(ctx, sc, expectedStats[tableID], tableID); err != nil {
 			t.Fatal(err)
@@ -213,7 +242,7 @@ func TestTableStatisticsCache(t *testing.T) {
 	// Table IDs 0 and 1 should have been evicted since the cache size is 2.
 	tableIDs = []sqlbase.ID{sqlbase.ID(100), sqlbase.ID(101)}
 	for _, tableID := range tableIDs {
-		if statsList, ok := sc.lookupTableStats(ctx, tableID); ok {
+		if statsList, ok := lookupTableStats(ctx, sc, tableID); ok {
 			t.Fatalf("lookup of evicted key %d returned: %s", tableID, statsList)
 		}
 	}
@@ -221,7 +250,7 @@ func TestTableStatisticsCache(t *testing.T) {
 	// Table IDs 2 and 3 should still be in the cache.
 	tableIDs = []sqlbase.ID{sqlbase.ID(102), sqlbase.ID(103)}
 	for _, tableID := range tableIDs {
-		if _, ok := sc.lookupTableStats(ctx, tableID); !ok {
+		if _, ok := lookupTableStats(ctx, sc, tableID); !ok {
 			t.Fatalf("for lookup of key %d, expected stats %s", tableID, expectedStats[tableID])
 		}
 	}
@@ -229,7 +258,109 @@ func TestTableStatisticsCache(t *testing.T) {
 	// After invalidation Table ID 2 should be gone.
 	tableID := sqlbase.ID(102)
 	sc.InvalidateTableStats(ctx, tableID)
-	if statsList, ok := sc.lookupTableStats(ctx, tableID); ok {
+	if statsList, ok := lookupTableStats(ctx, sc, tableID); ok {
 		t.Fatalf("lookup of invalidated key %d returned: %s", tableID, statsList)
+	}
+}
+
+func TestCacheUserDefinedTypes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := sqlDB.Exec(`
+SET experimental_enable_enums=true;
+CREATE DATABASE t;
+USE t;
+CREATE TYPE t AS ENUM ('hello');
+CREATE TABLE tt (x t PRIMARY KEY);
+INSERT INTO tt VALUES ('hello');
+CREATE STATISTICS s FROM tt;
+`); err != nil {
+		t.Fatal(err)
+	}
+	_ = kvDB
+	// Make a stats cache.
+	sc := NewTableStatisticsCache(
+		1,
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		kvDB,
+		s.InternalExecutor().(sqlutil.InternalExecutor),
+		keys.SystemSQLCodec,
+	)
+	tbl := sqlbase.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "tt")
+	// Get stats for our table. We are ensuring here that the access to the stats
+	// for tt properly hydrates the user defined type t before access.
+	_, err := sc.GetTableStats(ctx, tbl.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCacheWait verifies that when a table gets invalidated, we only retrieve
+// the stats one time, even if there are multiple callers asking for them.
+func TestCacheWait(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	ex := s.InternalExecutor().(sqlutil.InternalExecutor)
+
+	expectedStats, err := initTestData(ctx, db, ex)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Collect the tableIDs and sort them so we can iterate over them in a
+	// consistent order (Go randomizes the order of iteration over maps).
+	var tableIDs sqlbase.IDs
+	for tableID := range expectedStats {
+		tableIDs = append(tableIDs, tableID)
+	}
+	sort.Sort(tableIDs)
+	sc := NewTableStatisticsCache(
+		len(tableIDs), /* cacheSize */
+		gossip.MakeExposedGossip(s.GossipI().(*gossip.Gossip)),
+		db,
+		ex,
+		keys.SystemSQLCodec,
+	)
+	for _, tableID := range tableIDs {
+		if err := checkStatsForTable(ctx, sc, expectedStats[tableID], tableID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for run := 0; run < 10; run++ {
+		before := sc.mu.numInternalQueries
+
+		id := tableIDs[rand.Intn(len(tableIDs))]
+		sc.InvalidateTableStats(ctx, id)
+		// Run GetTableStats multiple times in parallel.
+		var wg sync.WaitGroup
+		for n := 0; n < 10; n++ {
+			wg.Add(1)
+			go func() {
+				stats, err := sc.GetTableStats(ctx, id)
+				if err != nil {
+					t.Error(err)
+				} else if !checkStats(stats, expectedStats[id]) {
+					t.Errorf("for table %d, expected stats %s, got %s", id, expectedStats[id], stats)
+				}
+				wg.Done()
+			}()
+		}
+		wg.Wait()
+
+		if t.Failed() {
+			return
+		}
+
+		// Verify that we only issued one read from the statistics table.
+		if num := sc.mu.numInternalQueries - before; num != 1 {
+			t.Fatalf("expected 1 query, got %d", num)
+		}
 	}
 }

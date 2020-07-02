@@ -1,16 +1,12 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
 
 package ts
 
@@ -18,20 +14,19 @@ import (
 	"context"
 	"math"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 )
 
 const (
@@ -98,7 +93,7 @@ type Server struct {
 	queryWorkerMax   int
 	workerMemMonitor mon.BytesMonitor
 	resultMemMonitor mon.BytesMonitor
-	workerSem        chan struct{}
+	workerSem        *quotapool.IntPool
 }
 
 // MakeServer instantiates a new Server which services requests with data from
@@ -121,7 +116,8 @@ func MakeServer(
 	if cfg.QueryMemoryMax != 0 {
 		queryMemoryMax = cfg.QueryMemoryMax
 	}
-
+	workerSem := quotapool.NewIntPool("ts.Server worker", uint64(queryWorkerMax))
+	stopper.AddCloser(workerSem.Closer("stopper"))
 	return Server{
 		AmbientContext: ambient,
 		db:             db,
@@ -149,7 +145,7 @@ func MakeServer(
 		),
 		queryMemoryMax: queryMemoryMax,
 		queryWorkerMax: queryWorkerMax,
-		workerSem:      make(chan struct{}, queryWorkerMax),
+		workerSem:      workerSem,
 	}
 }
 
@@ -186,7 +182,7 @@ func (s *Server) Query(
 	// dead. This is a conservatively long span, but gives us a good indication of
 	// when a gap likely indicates an outage (and thus missing values should not
 	// be interpolated).
-	interpolationLimit := storage.TimeUntilStoreDead.Get(&s.db.st.SV).Nanoseconds()
+	interpolationLimit := kvserver.TimeUntilStoreDead.Get(&s.db.st.SV).Nanoseconds()
 
 	// Get the estimated number of nodes on the cluster, used to compute more
 	// accurate memory usage estimates. Set a minimum of 1 in order to avoid
@@ -318,13 +314,13 @@ func (s *Server) Query(
 // and will thus not be totally organized by series.
 func (s *Server) Dump(req *tspb.DumpRequest, stream tspb.TimeSeries_DumpServer) error {
 	ctx := stream.Context()
-	span := roachpb.Span{
+	span := &roachpb.Span{
 		Key:    roachpb.Key(firstTSRKey),
 		EndKey: roachpb.Key(lastTSRKey),
 	}
 
-	for span.Valid() {
-		b := &client.Batch{}
+	for span != nil {
+		b := &kv.Batch{}
 		b.Header.MaxSpanRequestKeys = dumpBatchSize
 		b.Scan(span.Key, span.EndKey)
 		err := s.db.db.Run(ctx, b)
